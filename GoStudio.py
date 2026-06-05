@@ -155,7 +155,7 @@ def _parse_excel_variations(filepath):
     if not HAS_OPENPYXL:
         return {'error': 'openpyxl tidak terinstall. Jalankan: pip install openpyxl'}
     try:
-        wb = load_workbook(filepath, read_only=True, data_only=True)
+        wb = load_workbook(filepath, data_only=True)
     except Exception as e:
         return {'error': f'Gagal membaca Excel: {e}'}
 
@@ -300,7 +300,7 @@ def _parse_visual_seo(filepath):
     if not HAS_OPENPYXL:
         return {}, []
     try:
-        wb = load_workbook(filepath, read_only=True, data_only=True)
+        wb = load_workbook(filepath, data_only=True)
     except Exception:
         return {}, []
 

@@ -296,13 +296,13 @@ def _parse_excel_variations(filepath):
 
 def _parse_visual_seo(filepath):
     """Parse Visual SEO sheet for YouTube auto-fill data.
-    Returns dict keyed by variation NUMBER (string) for cross-sheet matching."""
+    Returns (dict, ordered_list) keyed by variation NUMBER and NAME for cross-sheet matching."""
     if not HAS_OPENPYXL:
-        return {}
+        return {}, []
     try:
         wb = load_workbook(filepath, read_only=True, data_only=True)
     except Exception:
-        return {}
+        return {}, []
 
     target_ws = None
     col_map = None
@@ -320,7 +320,7 @@ def _parse_visual_seo(filepath):
 
     if target_ws is None or col_map is None:
         wb.close()
-        return {}
+        return {}, []
 
     # Find the numeric "Variation" column (index 0 typically) separately
     # We need the raw number column, not "Variation Name"
@@ -339,6 +339,7 @@ def _parse_visual_seo(filepath):
                 var_num_col = idx
 
     seo_data = {}  # keyed by variation number (str) AND variation name for flexible lookup
+    seo_ordered = []  # ordered list for positional fallback
 
     for row in target_ws.iter_rows(min_row=2, values_only=True):
         # Get variation number
@@ -394,9 +395,10 @@ def _parse_visual_seo(filepath):
             seo_data[var_num] = entry
         if var_name_val:
             seo_data[var_name_val] = entry
+        seo_ordered.append(entry)
 
     wb.close()
-    return seo_data
+    return seo_data, seo_ordered
 
 
 def _scan_audio_folder(folder_path):
@@ -1069,6 +1071,7 @@ class GoStudioWindow(QMainWindow):
         # Excel
         self._excel_data = None
         self._excel_seo_data = {}
+        self._excel_seo_ordered = []
         self._excel_folder = ""
         self._excel_matches = {}
         self._excel_filepath = ""
@@ -1776,7 +1779,7 @@ class GoStudioWindow(QMainWindow):
             return
 
         self._excel_data = result
-        self._excel_seo_data = _parse_visual_seo(filepath)
+        self._excel_seo_data, self._excel_seo_ordered = _parse_visual_seo(filepath)
         self._log(f"SEO data loaded: {len(self._excel_seo_data)} entries, keys: {list(self._excel_seo_data.keys())[:6]}...")
         if result.get('var_num_map'):
             self._log(f"Var num map: {result['var_num_map']}")
@@ -1811,21 +1814,31 @@ class GoStudioWindow(QMainWindow):
         self.lbl_variation_note.setText(note if note else "")
 
         # Auto-fill YouTube from SEO data
-        # Try lookup by: variation name, then variation number, then index+1
+        # Strategy: try multiple lookup keys in order of specificity
         seo = None
+
+        # 1. Direct name match
         if var_name in self._excel_seo_data:
             seo = self._excel_seo_data[var_name]
-        else:
-            # Try by variation number from var_num_map
+
+        # 2. Try variation number from var_num_map
+        if not seo:
             var_num_map = self._excel_data.get('var_num_map', {})
             var_num = var_num_map.get(var_name)
             if var_num and var_num in self._excel_seo_data:
                 seo = self._excel_seo_data[var_num]
-            else:
-                # Fallback: try index+1 as string (common pattern: variation 1,2,3...)
-                idx_key = str(index + 1)
-                if idx_key in self._excel_seo_data:
-                    seo = self._excel_seo_data[idx_key]
+
+        # 3. Try index+1 as string (positional: variation 1, 2, 3...)
+        if not seo:
+            idx_key = str(index + 1)
+            if idx_key in self._excel_seo_data:
+                seo = self._excel_seo_data[idx_key]
+
+        # 4. Positional fallback: use the Nth entry from ordered SEO list
+        if not seo:
+            seo_ordered = self._excel_seo_ordered
+            if index < len(seo_ordered):
+                seo = seo_ordered[index]
 
         if seo:
             if seo.get('title'):
@@ -1834,7 +1847,7 @@ class GoStudioWindow(QMainWindow):
                 self.entry_desc.setPlainText(seo['description'][:5000])
             if seo.get('tags'):
                 self.entry_tags.setText(seo['tags'][:500])
-            self._log(f"SEO auto-fill: {seo.get('title', '')[:40]}...")
+            self._log(f"SEO auto-fill: {seo.get('title', '')[:50]}")
         else:
             self._log(f"SEO data tidak ditemukan untuk variasi: {var_name}")
 
@@ -2941,6 +2954,7 @@ class GoStudioWindow(QMainWindow):
         # Reset Excel
         self._excel_data = None
         self._excel_seo_data = {}
+        self._excel_seo_ordered = []
         self._excel_folder = ""
         self._excel_matches = {}
         self._set_audio_mode('manual')

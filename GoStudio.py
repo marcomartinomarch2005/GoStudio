@@ -1777,6 +1777,9 @@ class GoStudioWindow(QMainWindow):
 
         self._excel_data = result
         self._excel_seo_data = _parse_visual_seo(filepath)
+        self._log(f"SEO data loaded: {len(self._excel_seo_data)} entries, keys: {list(self._excel_seo_data.keys())[:6]}...")
+        if result.get('var_num_map'):
+            self._log(f"Var num map: {result['var_num_map']}")
 
         self.excel_import_zone.setStyleSheet(
             "QPushButton { background: #D1FAE5; border: 2px solid #10B981; border-radius: 10px; padding: 10px; font-size: 11px; font-weight: 600; color: #059669; }"
@@ -1808,16 +1811,21 @@ class GoStudioWindow(QMainWindow):
         self.lbl_variation_note.setText(note if note else "")
 
         # Auto-fill YouTube from SEO data
-        # Try lookup by: variation name, then variation number
+        # Try lookup by: variation name, then variation number, then index+1
         seo = None
         if var_name in self._excel_seo_data:
             seo = self._excel_seo_data[var_name]
         else:
-            # Try by variation number
+            # Try by variation number from var_num_map
             var_num_map = self._excel_data.get('var_num_map', {})
             var_num = var_num_map.get(var_name)
             if var_num and var_num in self._excel_seo_data:
                 seo = self._excel_seo_data[var_num]
+            else:
+                # Fallback: try index+1 as string (common pattern: variation 1,2,3...)
+                idx_key = str(index + 1)
+                if idx_key in self._excel_seo_data:
+                    seo = self._excel_seo_data[idx_key]
 
         if seo:
             if seo.get('title'):
@@ -1826,6 +1834,9 @@ class GoStudioWindow(QMainWindow):
                 self.entry_desc.setPlainText(seo['description'][:5000])
             if seo.get('tags'):
                 self.entry_tags.setText(seo['tags'][:500])
+            self._log(f"SEO auto-fill: {seo.get('title', '')[:40]}...")
+        else:
+            self._log(f"SEO data tidak ditemukan untuk variasi: {var_name}")
 
     def _pick_audio_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Pilih Folder Audio")

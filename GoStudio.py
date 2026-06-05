@@ -124,7 +124,7 @@ _COL_ALIASES = {
 _SEO_COL_ALIASES = {
     'variation': ['variation', 'variasi', 'version', 'variant', 'variation name'],
     'seo_title': ['title', 'judul', 'youtube title', 'video title', 'seo title'],
-    'seo_description': ['description', 'deskripsi', 'desc', 'youtube description'],
+    'seo_description': ['description', 'deskripsi', 'desc', 'youtube description', 'description + hashtags'],
     'seo_tags': ['tags', 'tag', 'keywords', 'keyword', 'youtube tags'],
     'seo_hashtags': ['hashtags', 'hashtag', '#'],
 }
@@ -205,6 +205,24 @@ def _parse_excel_variations(filepath):
     variations = {}
     variation_names_ordered = []
     all_titles = set()
+    var_num_map = {}  # {variation_name: variation_number_str} for SEO cross-ref
+
+    # Detect the numeric "Variation" column separately (col_map['variation'] points to "Variation Name")
+    rows_for_header = target_ws.iter_rows(values_only=True)
+    header_row_seq = next(rows_for_header, None)
+    var_num_col_idx = None
+    if header_row_seq:
+        for idx, cell in enumerate(header_row_seq):
+            if cell is None:
+                continue
+            val = str(cell).strip().lower()
+            if val in ('variation', 'variasi') and idx != col_map.get('variation'):
+                var_num_col_idx = idx
+                break
+        # If col_map['variation'] actually IS the numeric column (no "Variation Name" found),
+        # check if the data in first data row is numeric
+        if var_num_col_idx is None and 'variation' in col_map:
+            var_num_col_idx = None  # will try to extract number from var_name itself
 
     for row in target_ws.iter_rows(min_row=2, values_only=True):
         var_name = None
@@ -214,6 +232,11 @@ def _parse_excel_variations(filepath):
                 var_name = str(val).strip()
         if not var_name:
             continue
+
+        # Also grab variation number if separate column exists
+        var_num_val = None
+        if var_num_col_idx is not None and var_num_col_idx < len(row) and row[var_num_col_idx]:
+            var_num_val = str(row[var_num_col_idx]).strip()
 
         title = None
         if 'title' in col_map:
@@ -243,6 +266,8 @@ def _parse_excel_variations(filepath):
         if var_name not in variations:
             variations[var_name] = {'note': note or '', 'tracks': []}
             variation_names_ordered.append(var_name)
+            if var_num_val:
+                var_num_map[var_name] = var_num_val
         elif note and not variations[var_name]['note']:
             variations[var_name]['note'] = note
 
@@ -264,12 +289,14 @@ def _parse_excel_variations(filepath):
         'variations': variations,
         'variation_names': variation_names_ordered,
         'all_titles': list(all_titles),
+        'var_num_map': var_num_map,
         'error': None,
     }
 
 
 def _parse_visual_seo(filepath):
-    """Parse Visual SEO sheet for YouTube auto-fill data."""
+    """Parse Visual SEO sheet for YouTube auto-fill data.
+    Returns dict keyed by variation NUMBER (string) for cross-sheet matching."""
     if not HAS_OPENPYXL:
         return {}
     try:
@@ -295,15 +322,36 @@ def _parse_visual_seo(filepath):
         wb.close()
         return {}
 
-    seo_data = {}  # {variation_name: {title, description, tags}}
+    # Find the numeric "Variation" column (index 0 typically) separately
+    # We need the raw number column, not "Variation Name"
+    rows_iter = target_ws.iter_rows(values_only=True)
+    header_row = next(rows_iter, None)
+    var_num_col = None
+    var_name_col = None
+    if header_row:
+        for idx, cell in enumerate(header_row):
+            if cell is None:
+                continue
+            val = str(cell).strip().lower()
+            if val == 'variation name':
+                var_name_col = idx
+            elif val in ('variation', 'variasi'):
+                var_num_col = idx
+
+    seo_data = {}  # keyed by variation number (str) AND variation name for flexible lookup
 
     for row in target_ws.iter_rows(min_row=2, values_only=True):
-        var_name = None
-        if 'variation' in col_map:
-            val = row[col_map['variation']] if col_map['variation'] < len(row) else None
-            if val:
-                var_name = str(val).strip()
-        if not var_name:
+        # Get variation number
+        var_num = None
+        if var_num_col is not None and var_num_col < len(row) and row[var_num_col]:
+            var_num = str(row[var_num_col]).strip()
+
+        # Get variation name
+        var_name_val = None
+        if var_name_col is not None and var_name_col < len(row) and row[var_name_col]:
+            var_name_val = str(row[var_name_col]).strip()
+
+        if not var_num and not var_name_val:
             continue
 
         seo_title = ""
@@ -335,11 +383,17 @@ def _parse_visual_seo(filepath):
         if seo_hashtags:
             full_desc = f"{seo_desc}\n\n{seo_hashtags}" if seo_desc else seo_hashtags
 
-        seo_data[var_name] = {
+        entry = {
             'title': seo_title,
             'description': full_desc,
             'tags': seo_tags,
         }
+
+        # Store under both keys for flexible lookup
+        if var_num:
+            seo_data[var_num] = entry
+        if var_name_val:
+            seo_data[var_name_val] = entry
 
     wb.close()
     return seo_data
@@ -1754,8 +1808,18 @@ class GoStudioWindow(QMainWindow):
         self.lbl_variation_note.setText(note if note else "")
 
         # Auto-fill YouTube from SEO data
+        # Try lookup by: variation name, then variation number
+        seo = None
         if var_name in self._excel_seo_data:
             seo = self._excel_seo_data[var_name]
+        else:
+            # Try by variation number
+            var_num_map = self._excel_data.get('var_num_map', {})
+            var_num = var_num_map.get(var_name)
+            if var_num and var_num in self._excel_seo_data:
+                seo = self._excel_seo_data[var_num]
+
+        if seo:
             if seo.get('title'):
                 self.entry_title.setText(seo['title'][:100])
             if seo.get('description'):

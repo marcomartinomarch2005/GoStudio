@@ -296,7 +296,7 @@ def _parse_excel_variations(filepath):
 
 def _parse_visual_seo(filepath):
     """Parse Visual SEO sheet for YouTube auto-fill data.
-    Returns (dict, ordered_list) keyed by variation NUMBER and NAME for cross-sheet matching."""
+    Returns (dict, ordered_list). Dict keyed by variation name. List ordered by appearance."""
     if not HAS_OPENPYXL:
         return {}, []
     try:
@@ -304,98 +304,72 @@ def _parse_visual_seo(filepath):
     except Exception:
         return {}, []
 
-    target_ws = None
-    col_map = None
+    seo_data = {}
+    seo_ordered = []
 
+    # Search ALL sheets for one that has columns matching SEO pattern
     for ws in wb.worksheets:
-        if 'seo' in ws.title.lower() or 'visual' in ws.title.lower():
-            rows = ws.iter_rows(values_only=True)
-            first_row = next(rows, None)
-            if first_row:
-                detected = _detect_columns(first_row, _SEO_COL_ALIASES)
-                if 'variation' in detected and 'seo_title' in detected:
-                    target_ws = ws
-                    col_map = detected
-                    break
-
-    if target_ws is None or col_map is None:
-        wb.close()
-        return {}, []
-
-    # Find the numeric "Variation" column (index 0 typically) separately
-    # We need the raw number column, not "Variation Name"
-    rows_iter = target_ws.iter_rows(values_only=True)
-    header_row = next(rows_iter, None)
-    var_num_col = None
-    var_name_col = None
-    if header_row:
-        for idx, cell in enumerate(header_row):
-            if cell is None:
-                continue
-            val = str(cell).strip().lower()
-            if val == 'variation name':
-                var_name_col = idx
-            elif val in ('variation', 'variasi'):
-                var_num_col = idx
-
-    seo_data = {}  # keyed by variation number (str) AND variation name for flexible lookup
-    seo_ordered = []  # ordered list for positional fallback
-
-    for row in target_ws.iter_rows(min_row=2, values_only=True):
-        # Get variation number
-        var_num = None
-        if var_num_col is not None and var_num_col < len(row) and row[var_num_col]:
-            var_num = str(row[var_num_col]).strip()
-
-        # Get variation name
-        var_name_val = None
-        if var_name_col is not None and var_name_col < len(row) and row[var_name_col]:
-            var_name_val = str(row[var_name_col]).strip()
-
-        if not var_num and not var_name_val:
+        rows = list(ws.iter_rows(values_only=True))
+        if len(rows) < 2:
+            continue
+        header = rows[0]
+        if header is None:
             continue
 
-        seo_title = ""
-        if 'seo_title' in col_map:
-            val = row[col_map['seo_title']] if col_map['seo_title'] < len(row) else None
-            if val:
-                seo_title = str(val).strip()
+        # Detect columns using SEO aliases
+        col_map = _detect_columns(header, _SEO_COL_ALIASES)
+        # Must have at least title + (description or tags) to qualify as SEO sheet
+        if 'seo_title' not in col_map:
+            continue
+        if 'seo_description' not in col_map and 'seo_tags' not in col_map:
+            continue
 
-        seo_desc = ""
-        if 'seo_description' in col_map:
-            val = row[col_map['seo_description']] if col_map['seo_description'] < len(row) else None
-            if val:
-                seo_desc = str(val).strip()
+        # Found a valid SEO sheet — determine variation name column
+        var_col = col_map.get('variation')
 
-        seo_hashtags = ""
-        if 'seo_hashtags' in col_map:
-            val = row[col_map['seo_hashtags']] if col_map['seo_hashtags'] < len(row) else None
-            if val:
-                seo_hashtags = str(val).strip()
+        for row in rows[1:]:
+            if row is None or all(c is None for c in row):
+                continue
 
-        seo_tags = ""
-        if 'seo_tags' in col_map:
-            val = row[col_map['seo_tags']] if col_map['seo_tags'] < len(row) else None
-            if val:
-                seo_tags = str(val).strip()
+            # Get variation name
+            var_name = None
+            if var_col is not None and var_col < len(row) and row[var_col]:
+                var_name = str(row[var_col]).strip()
+            if not var_name:
+                continue
 
-        # Combine description + hashtags
-        full_desc = seo_desc
-        if seo_hashtags:
-            full_desc = f"{seo_desc}\n\n{seo_hashtags}" if seo_desc else seo_hashtags
+            # Get title
+            seo_title = ""
+            if 'seo_title' in col_map and col_map['seo_title'] < len(row) and row[col_map['seo_title']]:
+                seo_title = str(row[col_map['seo_title']]).strip()
 
-        entry = {
-            'title': seo_title,
-            'description': full_desc,
-            'tags': seo_tags,
-        }
+            # Get description
+            seo_desc = ""
+            if 'seo_description' in col_map and col_map['seo_description'] < len(row) and row[col_map['seo_description']]:
+                seo_desc = str(row[col_map['seo_description']]).strip()
 
-        # Store under both keys for flexible lookup
-        if var_num:
-            seo_data[var_num] = entry
-        if var_name_val:
-            seo_data[var_name_val] = entry
-        seo_ordered.append(entry)
+            # Get tags
+            seo_tags = ""
+            if 'seo_tags' in col_map and col_map['seo_tags'] < len(row) and row[col_map['seo_tags']]:
+                seo_tags = str(row[col_map['seo_tags']]).strip()
+
+            # Get hashtags (separate column if exists)
+            seo_hashtags = ""
+            if 'seo_hashtags' in col_map and col_map['seo_hashtags'] < len(row) and row[col_map['seo_hashtags']]:
+                seo_hashtags = str(row[col_map['seo_hashtags']]).strip()
+
+            # Combine description + hashtags
+            full_desc = seo_desc
+            if seo_hashtags and seo_hashtags not in seo_desc:
+                full_desc = f"{seo_desc}\n\n{seo_hashtags}" if seo_desc else seo_hashtags
+
+            entry = {'title': seo_title, 'description': full_desc, 'tags': seo_tags}
+            seo_data[var_name] = entry
+            seo_ordered.append(entry)
+
+        # Found and parsed — stop looking at other sheets
+        if seo_ordered:
+            break
 
     wb.close()
     return seo_data, seo_ordered
@@ -1779,7 +1753,11 @@ class GoStudioWindow(QMainWindow):
             return
 
         self._excel_data = result
-        self._excel_seo_data, self._excel_seo_ordered = _parse_visual_seo(filepath)
+        try:
+            self._excel_seo_data, self._excel_seo_ordered = _parse_visual_seo(filepath)
+        except Exception as e:
+            self._excel_seo_data, self._excel_seo_ordered = {}, []
+            self._log(f"SEO parse error: {e}")
         self._log(f"SEO data loaded: {len(self._excel_seo_data)} entries, keys: {list(self._excel_seo_data.keys())[:6]}...")
         if result.get('var_num_map'):
             self._log(f"Var num map: {result['var_num_map']}")

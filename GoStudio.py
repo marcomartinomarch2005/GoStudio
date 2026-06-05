@@ -1906,6 +1906,7 @@ class GoStudioWindow(QMainWindow):
         if not self.daftar_audio:
             self.tracklist_area.clear()
             self._update_size_estimate()
+            self._inject_tracklist_to_desc()
             return
 
         loop_count = 1
@@ -1942,6 +1943,30 @@ class GoStudioWindow(QMainWindow):
 
         self.tracklist_area.setPlainText("\n".join(lines))
         self._update_size_estimate()
+        self._inject_tracklist_to_desc()
+
+    def _inject_tracklist_to_desc(self):
+        """Auto-inject tracklist timestamp into description field."""
+        tracklist = self.tracklist_area.toPlainText().strip()
+        current_desc = self.entry_desc.toPlainText()
+
+        # Remove previous tracklist injection (everything after the marker)
+        marker = "\n\n\U0001F3B5 Tracklist:"
+        if marker in current_desc:
+            current_desc = current_desc[:current_desc.index(marker)]
+
+        # Append fresh tracklist
+        if tracklist:
+            new_desc = f"{current_desc}{marker}\n{tracklist}"
+        else:
+            new_desc = current_desc
+
+        # Only update if changed (prevent infinite signal loop)
+        if new_desc != self.entry_desc.toPlainText():
+            self.entry_desc.blockSignals(True)
+            self.entry_desc.setPlainText(new_desc[:5000])
+            self.entry_desc.blockSignals(False)
+            self._on_desc_changed()
 
     def _estimate_duration(self):
         if not self.daftar_audio:
@@ -2237,13 +2262,10 @@ class GoStudioWindow(QMainWindow):
         if pl_idx > 0 and (pl_idx - 1) < len(self.playlists):
             playlist_id = self.playlists[pl_idx - 1]["id"]
 
-        # Inject timestamp into description
+        # Description already has tracklist injected via _inject_tracklist_to_desc
         description = self.entry_desc.toPlainText()
-        tracklist_text = self._get_tracklist_text()
-        if tracklist_text:
-            description = f"{description}\n\n\U0001F3B5 Tracklist:\n{tracklist_text}"
-            if len(description) > 5000:
-                description = description[:5000]
+        if len(description) > 5000:
+            description = description[:5000]
 
         # Build unified task
         task = {

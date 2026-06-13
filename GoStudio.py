@@ -111,7 +111,7 @@ def deteksi_gpu_encoder():
 
 _COL_ALIASES = {
     'variation': ['variation', 'variasi', 'version', 'group', 'variant', 'variation name'],
-    'track_order': ['track order', 'order', 'no', 'urutan', 'track', 'sequence'],
+    'track_order': ['track order', 'order', 'no', 'urutan', 'track', 'sequence', 'slot'],
     'title': ['title', 'judul', 'nama', 'working title', 'song', 'lagu',
               'track title', 'track name', 'new track name', 'primary title', 'primary song title'],
     'session': ['session', 'sesi', 'section', 'session track', 'session function'],
@@ -312,8 +312,20 @@ def _parse_visual_seo(filepath):
         rows = list(ws.iter_rows(values_only=True))
         if len(rows) < 2:
             continue
+        header_idx = 0
         header = rows[0]
         if header is None:
+            continue
+
+        for idx, possible_header in enumerate(rows[:20]):
+            if possible_header is None:
+                continue
+            detected = _detect_columns(possible_header, _SEO_COL_ALIASES)
+            if 'seo_title' in detected and ('seo_description' in detected or 'seo_tags' in detected):
+                header_idx = idx
+                header = possible_header
+                break
+        else:
             continue
 
         # Detect columns using SEO aliases
@@ -327,7 +339,7 @@ def _parse_visual_seo(filepath):
         # Found a valid SEO sheet — determine variation name column
         var_col = col_map.get('variation')
 
-        for row in rows[1:]:
+        for row in rows[header_idx + 1:]:
             if row is None or all(c is None for c in row):
                 continue
 
@@ -545,13 +557,37 @@ def upload_video_to_youtube(youtube, task, signals, task_index):
         video_id = response.get("id", "")
         signals.log.emit(f"[Upload] Selesai! ID: {video_id} | https://youtu.be/{video_id}")
 
-        # Set thumbnail
+        # Set thumbnail (compress if > 2MB to meet YouTube API limit)
         if thumbnail_path and os.path.exists(thumbnail_path):
             try:
-                youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumbnail_path)).execute()
-                signals.log.emit(f"[Upload] Thumbnail set.")
+                upload_thumb = thumbnail_path
+                file_size = os.path.getsize(thumbnail_path)
+                if file_size > 2 * 1024 * 1024:
+                    # Re-compress to fit within 2MB limit
+                    from PyQt6.QtGui import QPixmap
+                    from PyQt6.QtCore import Qt as QtCore_Qt
+                    pixmap = QPixmap(thumbnail_path)
+                    if not pixmap.isNull():
+                        resized = pixmap.scaled(1280, 720, QtCore_Qt.AspectRatioMode.IgnoreAspectRatio, QtCore_Qt.TransformationMode.SmoothTransformation)
+                        # Try decreasing quality until under 2MB
+                        import tempfile
+                        for quality in [85, 75, 65, 55, 45]:
+                            tmp_path = os.path.join(tempfile.gettempdir(), f"gostudio_thumb_{video_id}.jpg")
+                            resized.save(tmp_path, "JPG", quality)
+                            if os.path.getsize(tmp_path) <= 2 * 1024 * 1024:
+                                upload_thumb = tmp_path
+                                break
+                        else:
+                            upload_thumb = tmp_path  # use lowest quality anyway
+                        signals.log.emit(f"[Upload] Thumbnail dikompresi: {file_size//1024}KB → {os.path.getsize(upload_thumb)//1024}KB")
+                youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(upload_thumb)).execute()
+                signals.log.emit(f"[Upload] Thumbnail set: {os.path.basename(thumbnail_path)}")
             except Exception as e:
                 signals.log.emit(f"[Upload] Thumbnail gagal: {e}")
+        elif thumbnail_path:
+            signals.log.emit(f"[Upload] Thumbnail file tidak ditemukan: {thumbnail_path}")
+        else:
+            signals.log.emit("[Upload] Thumbnail dilewati: belum ada file thumbnail di task.")
 
         # Add to playlist
         if playlist_id:
@@ -729,7 +765,27 @@ class ComboPopupFrame(QFrame):
         self.adjustSize()
         bottom_left = self._combo.mapToGlobal(self._combo.rect().bottomLeft())
         h = min(self._combo.count() * 38 + 16, 280)
-        self.setGeometry(bottom_left.x(), bottom_left.y(), self._combo.width(), h)
+        w = max(self._combo.width(), 60)
+
+        # Get available screen geometry to avoid clipping
+        screen = QApplication.screenAt(bottom_left)
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        screen_geo = screen.availableGeometry()
+
+        x = bottom_left.x()
+        y = bottom_left.y()
+
+        # If popup would extend below the screen, show it above the combo box
+        if y + h > screen_geo.bottom():
+            top_left = self._combo.mapToGlobal(self._combo.rect().topLeft())
+            y = top_left.y() - h
+
+        # Clamp X to stay within screen
+        if x + w > screen_geo.right():
+            x = screen_geo.right() - w
+
+        self.setGeometry(x, y, w, h)
         self.show()
         self._list.setFocus()
         self.raise_()
@@ -1050,6 +1106,8 @@ class GoStudioWindow(QMainWindow):
         self._excel_matches = {}
         self._excel_filepath = ""
         self._audio_mode = 'manual'
+        self._asset_folder = ""
+        self._asset_assignments = {}  # {var_name: {'video': path, 'thumbnail': path}}
 
         # Signals
         self.signals = PipelineSignals()
@@ -1143,13 +1201,13 @@ class GoStudioWindow(QMainWindow):
         col3 = QVBoxLayout()
         col3.setSpacing(10)
         self._build_col3_tracklist(col3)
-        columns.addLayout(col3, 20)
+        columns.addLayout(col3, 17)
 
         # Column 4: Pipeline Queue + Log
         col4 = QVBoxLayout()
         col4.setSpacing(10)
         self._build_col4_pipeline(col4)
-        columns.addLayout(col4, 25)
+        columns.addLayout(col4, 28)
 
         root.addLayout(columns, 1)
 
@@ -1238,21 +1296,65 @@ class GoStudioWindow(QMainWindow):
         self.excel_import_zone.clicked.connect(self._import_excel)
         excel_layout.addWidget(self.excel_import_zone)
 
+        # --- Post-import widget with checklist + folders ---
         self.excel_variation_widget = QWidget()
         excel_var_layout = QVBoxLayout(self.excel_variation_widget)
         excel_var_layout.setContentsMargins(0, 0, 0, 0)
         excel_var_layout.setSpacing(5)
-        excel_var_layout.addWidget(QLabel("Variasi:"))
-        self.combo_variation = ModernComboBox()
-        self.combo_variation.currentIndexChanged.connect(self._on_variation_changed)
-        excel_var_layout.addWidget(self.combo_variation)
-        self.lbl_variation_note = QLabel("")
-        self.lbl_variation_note.setWordWrap(True)
-        self.lbl_variation_note.setStyleSheet("font-size: 10px; color: #6B7280; font-style: italic;")
-        excel_var_layout.addWidget(self.lbl_variation_note)
 
+        # Variation checklist header + Select All / Deselect
+        var_hdr = QHBoxLayout()
+        var_hdr.addWidget(QLabel("Variasi:"))
+        var_hdr.addStretch()
+        self.btn_select_all = QPushButton("All")
+        self.btn_select_all.setFixedSize(36, 20)
+        self.btn_select_all.setCursor(Qt.PointingHandCursor)
+        self.btn_select_all.setStyleSheet("QPushButton { background: #ECFDF5; color: #059669; border: none; border-radius: 4px; font-size: 9px; font-weight: bold; } QPushButton:hover { background: #D1FAE5; }")
+        self.btn_select_all.clicked.connect(self._select_all_variations)
+        self.btn_deselect_all = QPushButton("None")
+        self.btn_deselect_all.setFixedSize(36, 20)
+        self.btn_deselect_all.setCursor(Qt.PointingHandCursor)
+        self.btn_deselect_all.setStyleSheet("QPushButton { background: #FEF2F2; color: #DC2626; border: none; border-radius: 4px; font-size: 9px; font-weight: bold; } QPushButton:hover { background: #FEE2E2; }")
+        self.btn_deselect_all.clicked.connect(self._deselect_all_variations)
+        var_hdr.addWidget(self.btn_select_all)
+        var_hdr.addWidget(self.btn_deselect_all)
+        excel_var_layout.addLayout(var_hdr)
+
+        # Scrollable checklist for variations
+        self._variation_checkboxes = []
+        self.variation_scroll = QScrollArea()
+        self.variation_scroll.setWidgetResizable(True)
+        self.variation_scroll.setMaximumHeight(140)
+        self.variation_scroll.setStyleSheet("QScrollArea { background: transparent; border: 1px solid #E5E7EB; border-radius: 6px; }")
+        self.variation_scroll_container = QWidget()
+        self.variation_scroll_container.setStyleSheet("background: transparent;")
+        self.variation_list_layout = QVBoxLayout(self.variation_scroll_container)
+        self.variation_list_layout.setContentsMargins(4, 4, 4, 4)
+        self.variation_list_layout.setSpacing(2)
+        self.variation_list_layout.addStretch()
+        self.variation_scroll.setWidget(self.variation_scroll_container)
+        excel_var_layout.addWidget(self.variation_scroll)
+
+        self.lbl_variation_count = QLabel("")
+        self.lbl_variation_count.setStyleSheet("font-size: 9px; color: #6B7280;")
+        excel_var_layout.addWidget(self.lbl_variation_count)
+
+        # Folder Asset (Video + Thumbnail)
+        asset_row = QHBoxLayout()
+        self.btn_asset_folder = make_btn("\U0001F3AC Folder Asset")
+        self.btn_asset_folder.clicked.connect(self._pick_asset_folder)
+        asset_row.addWidget(self.btn_asset_folder)
+        self.lbl_asset_folder = QLabel("Belum dipilih")
+        self.lbl_asset_folder.setStyleSheet("font-size: 10px; color: #9CA3AF;")
+        asset_row.addWidget(self.lbl_asset_folder, 1)
+        self.lbl_asset_status = QLabel("")
+        self.lbl_asset_status.setStyleSheet("font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 600;")
+        asset_row.addWidget(self.lbl_asset_status)
+        excel_var_layout.addLayout(asset_row)
+
+        # Folder Audio (Music)
         folder_row = QHBoxLayout()
-        self.btn_excel_folder = make_btn("\U0001F4C2 Folder Audio")
+        self.btn_excel_folder = make_btn("\U0001F3B5 Folder Music")
         self.btn_excel_folder.clicked.connect(self._pick_audio_folder)
         folder_row.addWidget(self.btn_excel_folder)
         self.lbl_excel_folder = QLabel("Belum dipilih")
@@ -1263,9 +1365,11 @@ class GoStudioWindow(QMainWindow):
         folder_row.addWidget(self.lbl_match_status)
         excel_var_layout.addLayout(folder_row)
 
-        self.btn_apply_variation = make_btn("\u2714 Terapkan Urutan", "#0D9488", "white")
+        # Apply single variation (for preview/manual mode)
+        self.btn_apply_variation = make_btn("\u2714 Preview Variasi Terpilih")
         self.btn_apply_variation.clicked.connect(self._apply_variation_order)
         excel_var_layout.addWidget(self.btn_apply_variation)
+
         self.excel_variation_widget.setVisible(False)
         excel_layout.addWidget(self.excel_variation_widget)
         excel_layout.addStretch()
@@ -1383,6 +1487,12 @@ class GoStudioWindow(QMainWindow):
         btn_add_ch = make_btn("+ Login", "#0D9488", "white")
         btn_add_ch.clicked.connect(self._add_channel)
         ch_row.addWidget(btn_add_ch)
+        btn_remove_ch = make_btn("Hapus")
+        btn_remove_ch.clicked.connect(self._remove_channel)
+        ch_row.addWidget(btn_remove_ch)
+        self.lbl_channel_status = QLabel("")
+        self.lbl_channel_status.setStyleSheet("font-size: 10px; color: #9CA3AF;")
+        ch_row.addWidget(self.lbl_channel_status)
         l_yt.addLayout(ch_row)
 
         # Title
@@ -1428,11 +1538,20 @@ class GoStudioWindow(QMainWindow):
 
         # Category + Playlist + Privacy
         row_cpp = QHBoxLayout()
+        row_cpp.setSpacing(8)
         cat_col = QVBoxLayout()
         cat_col.addWidget(QLabel("Kategori"))
         self.combo_category = ModernComboBox()
         self.combo_category.addItems(list(YOUTUBE_CATEGORIES.keys()))
         self.combo_category.setCurrentText("Music")
+        self.combo_category.setFixedHeight(36)
+        self.combo_category.setStyleSheet(
+            "QComboBox { background-color: #FAFBFC; border: 1px solid #E5E7EB; border-radius: 8px;"
+            "padding: 0px 10px; font-size: 13px; color: #1a1a2e; }"
+            "QComboBox:hover { border-color: #0D9488; }"
+            "QComboBox::drop-down { border: none; width: 20px; }"
+            "QComboBox::down-arrow { image: none; }"
+        )
         cat_col.addWidget(self.combo_category)
         row_cpp.addLayout(cat_col)
 
@@ -1440,6 +1559,14 @@ class GoStudioWindow(QMainWindow):
         pp_left.addWidget(QLabel("Playlist"))
         self.combo_playlist = ModernComboBox()
         self.combo_playlist.addItem("(Tidak ada)")
+        self.combo_playlist.setFixedHeight(36)
+        self.combo_playlist.setStyleSheet(
+            "QComboBox { background-color: #FAFBFC; border: 1px solid #E5E7EB; border-radius: 8px;"
+            "padding: 0px 10px; font-size: 13px; color: #1a1a2e; }"
+            "QComboBox:hover { border-color: #0D9488; }"
+            "QComboBox::drop-down { border: none; width: 20px; }"
+            "QComboBox::down-arrow { image: none; }"
+        )
         pp_left.addWidget(self.combo_playlist)
         row_cpp.addLayout(pp_left)
 
@@ -1448,6 +1575,14 @@ class GoStudioWindow(QMainWindow):
         self.combo_privacy = ModernComboBox()
         self.combo_privacy.addItems(["Public", "Unlisted", "Private"])
         self.combo_privacy.setCurrentIndex(2)
+        self.combo_privacy.setFixedHeight(36)
+        self.combo_privacy.setStyleSheet(
+            "QComboBox { background-color: #FAFBFC; border: 1px solid #E5E7EB; border-radius: 8px;"
+            "padding: 0px 10px; font-size: 13px; color: #1a1a2e; }"
+            "QComboBox:hover { border-color: #0D9488; }"
+            "QComboBox::drop-down { border: none; width: 20px; }"
+            "QComboBox::down-arrow { image: none; }"
+        )
         self.combo_privacy.currentTextChanged.connect(self._on_privacy_changed)
         pp_right.addWidget(self.combo_privacy)
         row_cpp.addLayout(pp_right)
@@ -1480,7 +1615,7 @@ class GoStudioWindow(QMainWindow):
         for m in range(0, 60, 5):
             self.combo_minute.addItem(str(m).zfill(2), m)
         for w in [self.combo_day, self.combo_month, self.combo_year, self.combo_hour, self.combo_minute]:
-            w.setStyleSheet("QComboBox { border: none; background: transparent; padding: 4px 2px; font-size: 11px; font-weight: 600; min-width: 36px; } QComboBox::drop-down { border: none; width: 14px; } QComboBox::down-arrow { image: none; }")
+            w.setStyleSheet("QComboBox { border: none; background: transparent; padding: 4px 2px; font-size: 11px; font-weight: 600; min-width: 44px; } QComboBox::drop-down { border: none; width: 14px; } QComboBox::down-arrow { image: none; }")
         sched_layout.addWidget(self.combo_day)
         sched_layout.addWidget(QLabel("/"))
         sched_layout.addWidget(self.combo_month)
@@ -1519,7 +1654,74 @@ class GoStudioWindow(QMainWindow):
 
         scroll_layout.addWidget(c_yt, 1)
 
-        # Add to pipeline button
+        # ─── Schedule & Batch Section ────────────────────────────────────────
+        c_schedule, l_schedule = make_card()
+        l_schedule.setContentsMargins(12, 8, 12, 10)
+        l_schedule.setSpacing(6)
+        l_schedule.addWidget(make_card_title("\U0001F4C5 Jadwal Publish (Batch)"))
+
+        sched_row1 = QHBoxLayout()
+        sched_row1.setSpacing(6)
+        sched_row1.addWidget(QLabel("Mulai:"))
+        self.combo_sched_day = ModernComboBox()
+        for d in range(1, 32):
+            self.combo_sched_day.addItem(str(d).zfill(2), d)
+        self.combo_sched_month = ModernComboBox()
+        months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        for i, m in enumerate(months, 1):
+            self.combo_sched_month.addItem(m, i)
+        self.combo_sched_year = ModernComboBox()
+        current_year = datetime.datetime.now().year
+        for y in range(current_year, current_year + 3):
+            self.combo_sched_year.addItem(str(y), y)
+        self.combo_sched_hour = ModernComboBox()
+        for h in range(24):
+            self.combo_sched_hour.addItem(str(h).zfill(2), h)
+        self.combo_sched_minute = ModernComboBox()
+        for m in range(0, 60, 5):
+            self.combo_sched_minute.addItem(str(m).zfill(2), m)
+        for w in [self.combo_sched_day, self.combo_sched_month, self.combo_sched_year, self.combo_sched_hour, self.combo_sched_minute]:
+            w.setStyleSheet("QComboBox { border: none; background: transparent; padding: 4px 2px; font-size: 11px; font-weight: 600; min-width: 44px; } QComboBox::drop-down { border: none; width: 14px; } QComboBox::down-arrow { image: none; }")
+        sched_row1.addWidget(self.combo_sched_day)
+        sched_row1.addWidget(QLabel("/"))
+        sched_row1.addWidget(self.combo_sched_month)
+        sched_row1.addWidget(QLabel("/"))
+        sched_row1.addWidget(self.combo_sched_year)
+        sched_row1.addWidget(QLabel(" "))
+        sched_row1.addWidget(self.combo_sched_hour)
+        sched_row1.addWidget(QLabel(":"))
+        sched_row1.addWidget(self.combo_sched_minute)
+        lbl_wit_sched = QLabel("WIT")
+        lbl_wit_sched.setStyleSheet("background: #ECFDF5; color: #059669; padding: 3px 6px; border-radius: 4px; font-size: 9px; font-weight: bold;")
+        sched_row1.addWidget(lbl_wit_sched)
+        sched_row1.addStretch()
+        l_schedule.addLayout(sched_row1)
+
+        # Set default to tomorrow
+        now_wit = datetime.datetime.now(WIT_TZ) + datetime.timedelta(days=1)
+        self.combo_sched_day.setCurrentIndex(now_wit.day - 1)
+        self.combo_sched_month.setCurrentIndex(now_wit.month - 1)
+        self.combo_sched_hour.setCurrentIndex(now_wit.hour)
+        minute_idx = now_wit.minute // 5
+        if minute_idx < self.combo_sched_minute.count():
+            self.combo_sched_minute.setCurrentIndex(minute_idx)
+
+        # Interval
+        interval_row = QHBoxLayout()
+        interval_row.setSpacing(6)
+        interval_row.addWidget(QLabel("Interval:"))
+        self.entry_interval = QLineEdit("4")
+        self.entry_interval.setFixedWidth(44)
+        self.entry_interval.setAlignment(Qt.AlignCenter)
+        self.entry_interval.setStyleSheet("font-weight: 600;")
+        interval_row.addWidget(self.entry_interval)
+        interval_row.addWidget(QLabel("jam antar publish"))
+        interval_row.addStretch()
+        l_schedule.addLayout(interval_row)
+
+        scroll_layout.addWidget(c_schedule)
+
+        # Add to pipeline button (single manual)
         self.btn_add_pipeline = QPushButton("+ Tambah ke Antrian Pipeline")
         self.btn_add_pipeline.setCursor(Qt.PointingHandCursor)
         self.btn_add_pipeline.setStyleSheet(
@@ -1528,6 +1730,17 @@ class GoStudioWindow(QMainWindow):
         )
         self.btn_add_pipeline.clicked.connect(self._add_to_pipeline)
         col.addWidget(self.btn_add_pipeline)
+
+        # Batch Encode & Publish (the main action)
+        self.btn_batch_encode_publish = QPushButton("\u26A1 Encode & Publish Variasi Terpilih")
+        self.btn_batch_encode_publish.setCursor(Qt.PointingHandCursor)
+        self.btn_batch_encode_publish.setStyleSheet(
+            "QPushButton { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #F97316,stop:1 #EA580C);"
+            "color: white; border: none; border-radius: 10px; padding: 12px; font-size: 12px; font-weight: bold; }"
+            "QPushButton:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #EA580C,stop:1 #C2410C); }"
+        )
+        self.btn_batch_encode_publish.clicked.connect(self._batch_encode_publish)
+        col.addWidget(self.btn_batch_encode_publish)
 
 
     # ═══ COLUMN 3: TRACKLIST / TIMESTAMP ═════════════════════════════════════
@@ -1572,6 +1785,7 @@ class GoStudioWindow(QMainWindow):
     def _build_col4_pipeline(self, col):
         # Slot indicators
         c_slots, l_slots = make_card()
+        c_slots.setMinimumWidth(200)
         l_slots.addWidget(make_card_title("\U0001F504 Pipeline Slots"))
         slot_row = QHBoxLayout()
         self.lbl_encode_slot = QLabel("\u25CF Encode: idle")
@@ -1768,66 +1982,120 @@ class GoStudioWindow(QMainWindow):
         num_v = len(result['variation_names'])
         self.excel_import_zone.setText(f"\u2705 {os.path.basename(filepath)} ({num_v} variasi)")
 
-        self.combo_variation.blockSignals(True)
-        self.combo_variation.clear()
-        for name in result['variation_names']:
-            self.combo_variation.addItem(name)
-        self.combo_variation.blockSignals(False)
+        # Populate variation checkboxes
+        self._populate_variation_checkboxes(result['variation_names'])
         self.excel_variation_widget.setVisible(True)
-
-        if result['variation_names']:
-            self._on_variation_changed(0)
 
         if self._excel_folder:
             self._do_matching()
 
+    def _populate_variation_checkboxes(self, var_names):
+        """Clear and rebuild the variation checkbox list."""
+        # Clear existing
+        for cb in self._variation_checkboxes:
+            cb.deleteLater()
+        self._variation_checkboxes.clear()
+        # Remove all except the stretch
+        while self.variation_list_layout.count() > 1:
+            item = self.variation_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for name in var_names:
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            cb.setStyleSheet(
+                "QCheckBox { font-size: 11px; spacing: 6px; padding: 2px 4px; }"
+                "QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px; }"
+            )
+            cb.toggled.connect(self._update_variation_count)
+            self._variation_checkboxes.append(cb)
+            self.variation_list_layout.insertWidget(len(self._variation_checkboxes) - 1, cb)
+
+        self._update_variation_count()
+
+    def _update_variation_count(self):
+        """Update the selection count label."""
+        checked = sum(1 for cb in self._variation_checkboxes if cb.isChecked())
+        total = len(self._variation_checkboxes)
+        self.lbl_variation_count.setText(f"{checked}/{total} variasi dipilih")
+
+    def _select_all_variations(self):
+        for cb in self._variation_checkboxes:
+            cb.setChecked(True)
+
+    def _deselect_all_variations(self):
+        for cb in self._variation_checkboxes:
+            cb.setChecked(False)
+
     def _on_variation_changed(self, index):
-        if not self._excel_data or index < 0:
+        """Legacy callback - kept for single-variation preview compatibility."""
+        pass
+
+    def _pick_asset_folder(self):
+        """Pick folder containing video + thumbnail assets named by variation."""
+        folder = QFileDialog.getExistingDirectory(self, "Pilih Folder Asset (Video & Thumbnail)")
+        if not folder:
+            return
+        self._asset_folder = folder
+        display = folder if len(folder) <= 25 else "..." + folder[-22:]
+        self.lbl_asset_folder.setText(display)
+        self.lbl_asset_folder.setToolTip(folder)
+        self._do_asset_matching()
+
+    def _do_asset_matching(self):
+        """Match video/thumbnail files to variation names by substring."""
+        if not self._excel_data or not self._asset_folder:
             return
         var_names = self._excel_data['variation_names']
-        if index >= len(var_names):
-            return
-        var_name = var_names[index]
-        note = self._excel_data['variations'][var_name].get('note', '')
-        self.lbl_variation_note.setText(note if note else "")
+        # Scan folder for video and image files
+        videos = []
+        images = []
+        for dirpath, _dirnames, filenames in os.walk(self._asset_folder):
+            for filename in filenames:
+                ext = os.path.splitext(filename)[1].lower()
+                filepath = os.path.abspath(os.path.join(dirpath, filename))
+                if ext in VIDEO_EXTENSIONS:
+                    videos.append(filepath)
+                elif ext in IMAGE_EXTENSIONS:
+                    images.append(filepath)
+        videos.sort()
+        images.sort()
 
-        # Auto-fill YouTube from SEO data
-        # Strategy: try multiple lookup keys in order of specificity
-        seo = None
+        def asset_matches(path, var_name):
+            rel = os.path.relpath(path, self._asset_folder).lower()
+            if var_name.lower() in rel:
+                return True
+            var_num = self._excel_data.get('var_num_map', {}).get(var_name)
+            if var_num:
+                v_token = f"v{var_num}"
+                return re.search(rf'(^|[^a-z0-9]){re.escape(v_token)}([^a-z0-9]|$)', rel) is not None
+            return False
 
-        # 1. Direct name match
-        if var_name in self._excel_seo_data:
-            seo = self._excel_seo_data[var_name]
+        # Auto-assign by variation name or V-number folder/file token
+        self._asset_assignments = {}
+        for name in var_names:
+            assignment = {'video': None, 'thumbnail': None}
+            for vp in videos:
+                if asset_matches(vp, name):
+                    assignment['video'] = vp
+                    break
+            for ip in images:
+                if asset_matches(ip, name):
+                    assignment['thumbnail'] = ip
+                    break
+            self._asset_assignments[name] = assignment
 
-        # 2. Try variation number from var_num_map
-        if not seo:
-            var_num_map = self._excel_data.get('var_num_map', {})
-            var_num = var_num_map.get(var_name)
-            if var_num and var_num in self._excel_seo_data:
-                seo = self._excel_seo_data[var_num]
-
-        # 3. Try index+1 as string (positional: variation 1, 2, 3...)
-        if not seo:
-            idx_key = str(index + 1)
-            if idx_key in self._excel_seo_data:
-                seo = self._excel_seo_data[idx_key]
-
-        # 4. Positional fallback: use the Nth entry from ordered SEO list
-        if not seo:
-            seo_ordered = self._excel_seo_ordered
-            if index < len(seo_ordered):
-                seo = seo_ordered[index]
-
-        if seo:
-            if seo.get('title'):
-                self.entry_title.setText(seo['title'][:100])
-            if seo.get('description'):
-                self.entry_desc.setPlainText(seo['description'][:5000])
-            if seo.get('tags'):
-                self.entry_tags.setText(seo['tags'][:500])
-            self._log(f"SEO auto-fill: {seo.get('title', '')[:50]}")
+        # Update status
+        matched_v = sum(1 for a in self._asset_assignments.values() if a['video'])
+        total = len(var_names)
+        if matched_v == total:
+            self.lbl_asset_status.setText(f"{matched_v}/{total} \u2714")
+            self.lbl_asset_status.setStyleSheet("font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 600; background: #D1FAE5; color: #059669;")
         else:
-            self._log(f"SEO data tidak ditemukan untuk variasi: {var_name}")
+            self.lbl_asset_status.setText(f"{matched_v}/{total}")
+            self.lbl_asset_status.setStyleSheet("font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 600; background: #FEF3C7; color: #D97706;")
+        self._log(f"Asset matching: {matched_v}/{total} video, {sum(1 for a in self._asset_assignments.values() if a['thumbnail'])}/{total} thumbnail")
 
     def _pick_audio_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Pilih Folder Audio")
@@ -1858,16 +2126,21 @@ class GoStudioWindow(QMainWindow):
             self.lbl_match_status.setStyleSheet("font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 600; background: #FEF3C7; color: #D97706;")
 
     def _apply_variation_order(self):
+        """Preview the first checked variation — load its audio into the manual list."""
         if not self._excel_data or not self._excel_folder or not self._excel_matches:
             QMessageBox.warning(self, "Error", "Import Excel dan pilih folder audio terlebih dahulu!")
             return
-        var_index = self.combo_variation.currentIndex()
-        var_names = self._excel_data['variation_names']
-        if var_index < 0 or var_index >= len(var_names):
+        # Find first checked variation
+        var_name = None
+        for i, cb in enumerate(self._variation_checkboxes):
+            if cb.isChecked():
+                var_name = self._excel_data['variation_names'][i]
+                break
+        if not var_name:
+            QMessageBox.warning(self, "Error", "Tidak ada variasi yang dipilih!")
             return
-        var_name = var_names[var_index]
-        tracks = self._excel_data['variations'][var_name]['tracks']
 
+        tracks = self._excel_data['variations'][var_name]['tracks']
         new_audio = []
         new_durations = []
         for track in tracks:
@@ -1890,7 +2163,301 @@ class GoStudioWindow(QMainWindow):
         self.audio_durations = new_durations
         self._set_audio_mode('manual')
         self._refresh_audio_list()
-        self._log(f"Variasi '{var_name}' diterapkan: {len(new_audio)} lagu")
+
+        # Also auto-fill SEO for preview
+        var_idx = self._excel_data['variation_names'].index(var_name)
+        var_num_map = self._excel_data.get('var_num_map', {})
+        seo = self._resolve_seo_for_variation(var_name, var_idx, var_num_map)
+        if seo:
+            if seo.get('title'):
+                self.entry_title.setText(seo['title'][:100])
+            if seo.get('description'):
+                self.entry_desc.setPlainText(seo['description'][:5000])
+            if seo.get('tags'):
+                self.entry_tags.setText(seo['tags'][:500])
+
+        # Set video from asset assignment if available
+        asset = self._asset_assignments.get(var_name, {})
+        if asset.get('video'):
+            self.jalur_video = asset['video']
+            self.lbl_video.setText(os.path.basename(self.jalur_video))
+            self.lbl_video.setStyleSheet("font-size: 11px; font-weight: 500; color: #1a1a2e;")
+            self._update_video_preview(self.jalur_video)
+        if asset.get('thumbnail'):
+            self._thumbnail_path = asset['thumbnail']
+            self.lbl_thumb.setText(os.path.basename(self._thumbnail_path))
+            self.lbl_thumb.setStyleSheet("font-size: 10px; color: #059669; font-weight: 500;")
+
+        self._log(f"Preview variasi '{var_name}': {len(new_audio)} lagu")
+
+    def _batch_encode_publish(self):
+        """Batch encode & publish: process all CHECKED variations with interval scheduling."""
+        # Validate prerequisites
+        if not self._excel_data or not self._excel_folder or not self._excel_matches:
+            QMessageBox.warning(self, "Error", "Import Excel dan pilih folder music terlebih dahulu!")
+            return
+        if not self._asset_folder or not self._asset_assignments:
+            QMessageBox.warning(self, "Error", "Pilih folder asset (video & thumbnail) terlebih dahulu!")
+            return
+
+        channel_name = self.combo_channel.currentText()
+        if not channel_name or channel_name not in self.channels:
+            QMessageBox.warning(self, "Error", "Login ke channel YouTube terlebih dahulu!")
+            return
+
+        # Collect selected variations
+        selected_names = []
+        for i, cb in enumerate(self._variation_checkboxes):
+            if cb.isChecked():
+                selected_names.append(self._excel_data['variation_names'][i])
+
+        if not selected_names:
+            QMessageBox.warning(self, "Error", "Tidak ada variasi yang dipilih!")
+            return
+
+        # Ask for output folder
+        output_folder = QFileDialog.getExistingDirectory(self, "Pilih Folder Output Encode")
+        if not output_folder:
+            return
+
+        # Parse scheduling
+        try:
+            day = self.combo_sched_day.currentData()
+            month = self.combo_sched_month.currentData()
+            year = self.combo_sched_year.currentData()
+            hour = self.combo_sched_hour.currentData()
+            minute = self.combo_sched_minute.currentData()
+            start_dt = datetime.datetime(year, month, day, hour, minute, tzinfo=WIT_TZ)
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Tanggal mulai tidak valid!")
+            return
+
+        try:
+            interval_hours = float(self.entry_interval.text())
+        except ValueError:
+            interval_hours = 4.0
+
+        # Gather render settings
+        variations = self._excel_data['variations']
+        var_num_map = self._excel_data.get('var_num_map', {})
+        idx_enc = self.combo_encoder.currentIndex()
+        encoder_codec = self.daftar_encoder[idx_enc][1]
+
+        mode_dur = "audio"
+        durasi_manual = None
+        jumlah_loop = None
+        if self.radio_manual.isChecked():
+            mode_dur = "manual"
+            try:
+                h = int(self.entry_jam.text())
+                m = int(self.entry_menit.text())
+                s = int(self.entry_detik.text())
+                durasi_manual = h * 3600 + m * 60 + s
+                if durasi_manual <= 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.warning(self, "Error", "Format durasi tidak valid!")
+                return
+        elif self.radio_loop.isChecked():
+            mode_dur = "loop"
+            try:
+                jumlah_loop = max(1, int(self.entry_loop.text()))
+            except ValueError:
+                QMessageBox.warning(self, "Error", "Jumlah pengulangan tidak valid!")
+                return
+
+        crossfade_enabled = self.chk_crossfade.isChecked()
+        crossfade_dur = int(self.combo_crossfade_dur.currentText().split()[0]) if crossfade_enabled else 0
+        audio_bitrate = self.combo_bitrate.currentText().split()[0] + "k"
+        fps = self.combo_fps.currentText().split()[0]
+        privacy = self.combo_privacy.currentText().lower()
+        category_name = self.combo_category.currentText() if hasattr(self, 'combo_category') else "Music"
+        category_id = YOUTUBE_CATEGORIES.get(category_name, "10")
+
+        playlist_id = None
+        pl_idx = self.combo_playlist.currentIndex()
+        if pl_idx > 0 and (pl_idx - 1) < len(self.playlists):
+            playlist_id = self.playlists[pl_idx - 1]["id"]
+
+        # Process each selected variation
+        added_count = 0
+        skipped = []
+
+        self._log("=" * 30)
+        self._log(f"BATCH ENCODE & PUBLISH: {len(selected_names)} variasi")
+        self._log(f"Start: {start_dt.strftime('%d/%m/%Y %H:%M')} WIT | Interval: {interval_hours}h")
+        self._log("=" * 30)
+
+        for task_num, var_name in enumerate(selected_names):
+            tracks = variations[var_name]['tracks']
+
+            # Match audio files for this variation
+            var_audio = []
+            var_durations = []
+            for track in tracks:
+                title = track['title']
+                file_path = self._excel_matches.get(title)
+                if file_path and os.path.exists(file_path):
+                    var_audio.append(file_path)
+                    try:
+                        clip = AudioFileClip(file_path)
+                        var_durations.append(clip.duration)
+                        clip.close()
+                    except Exception:
+                        var_durations.append(0.0)
+
+            if not var_audio:
+                skipped.append(var_name)
+                self._log(f"[Batch] SKIP: '{var_name}' — tidak ada audio cocok")
+                continue
+
+            # Get video from asset assignment
+            asset = self._asset_assignments.get(var_name, {})
+            video_path = asset.get('video')
+            if not video_path:
+                # Fallback to main video if no asset matched
+                video_path = self.jalur_video
+            if not video_path:
+                skipped.append(var_name)
+                self._log(f"[Batch] SKIP: '{var_name}' — tidak ada video")
+                continue
+
+            # Get thumbnail from asset assignment
+            thumbnail_path = asset.get('thumbnail')
+
+            # Calculate scheduled time: start_dt + (task_num * interval_hours)
+            task_scheduled_dt = start_dt + datetime.timedelta(hours=interval_hours * task_num)
+            utc_dt = task_scheduled_dt.astimezone(ZoneInfo("UTC"))
+            scheduled_time = utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+            # Resolve SEO data
+            var_idx = self._excel_data['variation_names'].index(var_name)
+            seo = self._resolve_seo_for_variation(var_name, var_idx, var_num_map)
+
+            yt_title = seo.get('title', '') if seo else ''
+            if not yt_title:
+                yt_title = var_name[:100]
+
+            yt_description = seo.get('description', '') if seo else ''
+
+            # Generate tracklist
+            tracklist_lines = self._generate_tracklist_for_variation(var_audio, var_durations, crossfade_dur, mode_dur, jumlah_loop)
+            if tracklist_lines:
+                marker = "\n\n\U0001F3B5 Tracklist:\n"
+                yt_description = f"{yt_description}{marker}{tracklist_lines}"
+            if len(yt_description) > 5000:
+                yt_description = yt_description[:5000]
+
+            tags_raw = seo.get('tags', '') if seo else ''
+            tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+
+            # Output path
+            safe_name = re.sub(r'[<>:"/\\|?*]', '_', var_name)
+            output_path = os.path.join(output_folder, f"{safe_name}.mp4")
+
+            # Build unified task
+            task = {
+                'video': video_path,
+                'audio': list(var_audio),
+                'audio_durations': list(var_durations),
+                'output_path': output_path,
+                'kompresi': self.combo_mode.currentText(),
+                'fps': fps,
+                'encoder': encoder_codec,
+                'mode_durasi': mode_dur,
+                'durasi_manual': durasi_manual,
+                'jumlah_loop': jumlah_loop,
+                'overlay': self.chk_overlay.isChecked(),
+                'overlay_pos': self.combo_overlay_pos.currentText() if self.chk_overlay.isChecked() else None,
+                'audio_bitrate': audio_bitrate,
+                'crossfade': crossfade_enabled,
+                'crossfade_dur': crossfade_dur,
+                'channel': channel_name,
+                'yt_title': yt_title[:100],
+                'yt_description': yt_description,
+                'yt_tags': tags,
+                'yt_category_id': category_id,
+                'yt_privacy': privacy,
+                'yt_scheduled_time': scheduled_time,
+                'yt_thumbnail_path': thumbnail_path,
+                'yt_playlist_id': playlist_id,
+                'status': 'waiting',
+                'video_path': output_path,
+            }
+
+            self.pipeline_queue.append(task)
+            self._add_pipeline_widget(task)
+            added_count += 1
+            sched_str = task_scheduled_dt.strftime("%d/%m %H:%M")
+            self._log(f"[Batch] +: {yt_title[:40]} | {sched_str} WIT ({len(var_audio)} lagu)")
+
+        # Summary
+        self._log("=" * 30)
+        self._log(f"BATCH SELESAI: {added_count} ditambahkan, {len(skipped)} dilewati")
+        if skipped:
+            self._log(f"Dilewati: {', '.join(skipped)}")
+        self._log("=" * 30)
+
+        if added_count > 0:
+            last_dt = start_dt + datetime.timedelta(hours=interval_hours * (added_count - 1))
+            QMessageBox.information(
+                self, "Batch Encode & Publish",
+                f"{added_count} variasi ditambahkan ke pipeline.\n"
+                f"{len(skipped)} dilewati.\n\n"
+                f"Jadwal: {start_dt.strftime('%d/%m/%Y %H:%M')} — {last_dt.strftime('%d/%m/%Y %H:%M')} WIT\n"
+                f"Interval: {interval_hours} jam\n\n"
+                f"Klik '\u25b6 Mulai Pipeline' untuk memproses."
+            )
+        else:
+            QMessageBox.warning(self, "Batch Encode", "Tidak ada variasi yang bisa di-encode!\nPastikan audio dan asset sudah ter-match.")
+
+    def _resolve_seo_for_variation(self, var_name, var_idx, var_num_map):
+        """Resolve SEO data for a variation using multiple lookup strategies."""
+        seo = None
+
+        # 1. Direct name match
+        if var_name in self._excel_seo_data:
+            seo = self._excel_seo_data[var_name]
+
+        # 2. Try variation number from var_num_map
+        if not seo:
+            var_num = var_num_map.get(var_name)
+            if var_num and var_num in self._excel_seo_data:
+                seo = self._excel_seo_data[var_num]
+
+        # 3. Try index+1 as string
+        if not seo:
+            idx_key = str(var_idx + 1)
+            if idx_key in self._excel_seo_data:
+                seo = self._excel_seo_data[idx_key]
+
+        # 4. Positional fallback from ordered SEO list
+        if not seo:
+            if var_idx < len(self._excel_seo_ordered):
+                seo = self._excel_seo_ordered[var_idx]
+
+        return seo
+
+    def _generate_tracklist_for_variation(self, audio_files, durations, crossfade_dur, mode_dur, jumlah_loop):
+        """Generate tracklist timestamp text for a specific variation's audio files."""
+        loop_count = jumlah_loop if mode_dur == "loop" and jumlah_loop else 1
+        total_tracks = len(audio_files) * loop_count
+        track_num = 0
+        lines = []
+        waktu = 0.0
+
+        for loop_i in range(loop_count):
+            for i, path in enumerate(audio_files):
+                track_num += 1
+                ts = self._format_waktu(waktu)
+                nama = os.path.splitext(os.path.basename(path))[0]
+                nama = self._strip_track_number(nama)
+                lines.append(f"{ts}  {nama}")
+                dur = durations[i] if i < len(durations) else 0
+                effective_dur = dur - crossfade_dur if (track_num < total_tracks and crossfade_dur > 0) else dur
+                waktu += max(0, effective_dur)
+
+        return "\n".join(lines)
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -2069,6 +2636,8 @@ class GoStudioWindow(QMainWindow):
             youtube, err = YouTubeAuth.authenticate(name)
             if err:
                 self.signals.log.emit(f"Auth gagal: {err}")
+                self.lbl_channel_status.setText("\u2716 Gagal")
+                self.lbl_channel_status.setStyleSheet("font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 600; background: #FEE2E2; color: #DC2626;")
                 return
             ch_title, ch_id, thumb_url = YouTubeAuth.get_channel_info(youtube)
             if ch_title:
@@ -2077,12 +2646,40 @@ class GoStudioWindow(QMainWindow):
             self.channels[name] = youtube
             self.combo_channel.addItem(name)
             self.combo_channel.setCurrentText(name)
+            self.lbl_channel_status.setText(f"\u2714 Terhubung")
+            self.lbl_channel_status.setStyleSheet("font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 600; background: #D1FAE5; color: #059669;")
 
         threading.Thread(target=do_auth, daemon=True).start()
+
+    def _remove_channel(self):
+        """Remove the currently selected channel token."""
+        name = self.combo_channel.currentText()
+        if not name:
+            return
+        reply = QMessageBox.question(
+            self, "Hapus Channel",
+            f"Hapus akun '{name}'?\nToken akan dihapus dan perlu login ulang.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        YouTubeAuth.remove_channel(name)
+        if name in self.channels:
+            del self.channels[name]
+        if name in self.channel_info:
+            del self.channel_info[name]
+        idx = self.combo_channel.findText(name)
+        if idx >= 0:
+            self.combo_channel.removeItem(idx)
+        self.lbl_channel_status.setText("")
+        self.lbl_channel_status.setStyleSheet("font-size: 10px; color: #9CA3AF;")
+        self._log(f"Channel '{name}' dihapus.")
 
     def _on_channel_changed(self, index):
         name = self.combo_channel.currentText()
         if not name:
+            self.lbl_channel_status.setText("")
+            self.lbl_channel_status.setStyleSheet("font-size: 10px; color: #9CA3AF;")
             return
         if name not in self.channels:
             youtube, err = YouTubeAuth.get_service(name)
@@ -2092,9 +2689,16 @@ class GoStudioWindow(QMainWindow):
                     ch_title, ch_id, _ = YouTubeAuth.get_channel_info(youtube)
                     if ch_title:
                         self.channel_info[name] = {"title": ch_title, "id": ch_id}
+                self.lbl_channel_status.setText(f"\u2714 Terhubung")
+                self.lbl_channel_status.setStyleSheet("font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 600; background: #D1FAE5; color: #059669;")
             else:
                 self._log(f"Channel '{name}': {err}")
+                self.lbl_channel_status.setText("\u2716 Expired")
+                self.lbl_channel_status.setStyleSheet("font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 600; background: #FEE2E2; color: #DC2626;")
                 return
+        else:
+            self.lbl_channel_status.setText(f"\u2714 Terhubung")
+            self.lbl_channel_status.setStyleSheet("font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 600; background: #D1FAE5; color: #059669;")
         self._refresh_playlists()
 
     def _refresh_playlists(self):
@@ -2957,16 +3561,23 @@ class GoStudioWindow(QMainWindow):
         self._excel_seo_ordered = []
         self._excel_folder = ""
         self._excel_matches = {}
+        self._asset_folder = ""
+        self._asset_assignments = {}
         self._set_audio_mode('manual')
         self.excel_import_zone.setStyleSheet(
             "QPushButton { background: #F0FDFA; border: 2px dashed #0D9488; border-radius: 10px; padding: 14px; font-size: 11px; font-weight: 600; color: #6B7280; }"
             "QPushButton:hover { border-color: #0B7C72; background: #CCFBF1; }"
         )
         self.excel_import_zone.setText("\U0001F4CA  Klik untuk Import Excel (.xlsx)")
-        self.combo_variation.clear()
-        self.lbl_variation_note.setText("")
+        # Clear variation checkboxes
+        for cb in self._variation_checkboxes:
+            cb.deleteLater()
+        self._variation_checkboxes.clear()
+        self.lbl_variation_count.setText("")
         self.lbl_excel_folder.setText("Belum dipilih")
         self.lbl_match_status.setText("")
+        self.lbl_asset_folder.setText("Belum dipilih")
+        self.lbl_asset_status.setText("")
         self.excel_variation_widget.setVisible(False)
 
         # Reset slot indicators

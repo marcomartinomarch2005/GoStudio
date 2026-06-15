@@ -3249,6 +3249,12 @@ class GoStudioWindow(QMainWindow):
             # GPU fallback to CPU
             if not sukses and encoder != "libx264":
                 self.signals.log.emit("[Encode] GPU gagal, fallback CPU...")
+                # Remove partial/corrupt output from failed GPU attempt
+                if os.path.exists(jalur_simpan):
+                    try:
+                        os.remove(jalur_simpan)
+                    except Exception:
+                        pass
                 tugas_cpu = dict(tugas)
                 tugas_cpu['encoder'] = 'libx264'
                 if crossfade_enabled and len(full_audio_list) > 1:
@@ -3312,7 +3318,7 @@ class GoStudioWindow(QMainWindow):
 
     def _build_cmd_with_audio_file(self, tugas, ffmpeg_exe, audio_file_path, total_durasi, jalur_simpan):
         fps = tugas['fps']
-        cmd = [ffmpeg_exe, "-y", "-stream_loop", "-1", "-i", tugas['video'], "-i", audio_file_path, "-map", "0:v", "-map", "1:a"]
+        cmd = [ffmpeg_exe, "-y", "-nostdin", "-stream_loop", "-1", "-i", tugas['video'], "-i", audio_file_path, "-map", "0:v", "-map", "1:a"]
         vf_filter = self._build_overlay_filter(tugas) if tugas.get('overlay') else None
         if vf_filter:
             cmd += ["-vf", vf_filter]
@@ -3323,7 +3329,7 @@ class GoStudioWindow(QMainWindow):
     def _build_cmd(self, tugas, ffmpeg_exe, file_list_path, total_durasi, jalur_simpan):
         fps = tugas['fps']
         mode_durasi = tugas.get('mode_durasi', 'audio')
-        cmd = [ffmpeg_exe, "-y", "-stream_loop", "-1", "-i", tugas['video']]
+        cmd = [ffmpeg_exe, "-y", "-nostdin", "-stream_loop", "-1", "-i", tugas['video']]
         if mode_durasi == "manual":
             cmd += ["-stream_loop", "-1"]
         cmd += ["-f", "concat", "-safe", "0", "-i", file_list_path, "-map", "0:v", "-map", "1:a"]
@@ -3445,23 +3451,30 @@ class GoStudioWindow(QMainWindow):
 
     def _run_ffmpeg(self, cmd, total_durasi, task_index):
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
             self._current_proc = proc
             pola = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})")
+            last_progress_time = time.time()
             for line in proc.stdout:
                 if task_index in self._cancel_requested:
                     proc.kill()
                     return False
                 m = pola.search(line)
                 if m:
+                    last_progress_time = time.time()
                     h, mi, s = m.groups()
                     elapsed = int(h)*3600 + int(mi)*60 + float(s)
                     if total_durasi > 0:
                         pct = min(100.0, (elapsed / total_durasi) * 100)
                         self.signals.encode_progress.emit(task_index, pct)
-            proc.wait()
+            proc.wait(timeout=60)
             self._current_proc = None
             return proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self._current_proc = None
+            self.signals.log.emit("[Encode] FFmpeg timeout saat wait.")
+            return False
         except Exception:
             self._current_proc = None
             return False

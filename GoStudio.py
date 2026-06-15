@@ -1186,28 +1186,40 @@ class GoStudioWindow(QMainWindow):
         columns.setSpacing(12)
 
         # Column 1: Media
-        col1 = QVBoxLayout()
+        col1_widget = QWidget()
+        col1_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        col1 = QVBoxLayout(col1_widget)
+        col1.setContentsMargins(0, 0, 0, 0)
         col1.setSpacing(10)
         self._build_col1_media(col1)
-        columns.addLayout(col1, 22)
+        columns.addWidget(col1_widget, 22)
 
         # Column 2: Render Options + YouTube Detail
-        col2 = QVBoxLayout()
+        col2_widget = QWidget()
+        col2_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        col2 = QVBoxLayout(col2_widget)
+        col2.setContentsMargins(0, 0, 0, 0)
         col2.setSpacing(10)
         self._build_col2_render_youtube(col2)
-        columns.addLayout(col2, 33)
+        columns.addWidget(col2_widget, 33)
 
         # Column 3: Tracklist/Timestamp
-        col3 = QVBoxLayout()
+        col3_widget = QWidget()
+        col3_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        col3 = QVBoxLayout(col3_widget)
+        col3.setContentsMargins(0, 0, 0, 0)
         col3.setSpacing(10)
         self._build_col3_tracklist(col3)
-        columns.addLayout(col3, 17)
+        columns.addWidget(col3_widget, 17)
 
         # Column 4: Pipeline Queue + Log
-        col4 = QVBoxLayout()
+        col4_widget = QWidget()
+        col4_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        col4 = QVBoxLayout(col4_widget)
+        col4.setContentsMargins(0, 0, 0, 0)
         col4.setSpacing(10)
         self._build_col4_pipeline(col4)
-        columns.addLayout(col4, 28)
+        columns.addWidget(col4_widget, 28)
 
         root.addLayout(columns, 1)
 
@@ -1289,6 +1301,7 @@ class GoStudioWindow(QMainWindow):
         excel_layout.setSpacing(8)
         self.excel_import_zone = QPushButton("\U0001F4CA  Klik untuk Import Excel (.xlsx)")
         self.excel_import_zone.setCursor(Qt.PointingHandCursor)
+        self.excel_import_zone.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.excel_import_zone.setStyleSheet(
             "QPushButton { background: #F0FDFA; border: 2px dashed #0D9488; border-radius: 10px; padding: 14px; font-size: 11px; font-weight: 600; color: #6B7280; }"
             "QPushButton:hover { border-color: #0B7C72; background: #CCFBF1; }"
@@ -1980,7 +1993,12 @@ class GoStudioWindow(QMainWindow):
             "QPushButton { background: #D1FAE5; border: 2px solid #10B981; border-radius: 10px; padding: 10px; font-size: 11px; font-weight: 600; color: #059669; }"
         )
         num_v = len(result['variation_names'])
-        self.excel_import_zone.setText(f"\u2705 {os.path.basename(filepath)} ({num_v} variasi)")
+        # Truncate filename to fit within card width
+        basename = os.path.basename(filepath)
+        max_chars = 40
+        if len(basename) > max_chars:
+            basename = basename[:max_chars - 3] + "..."
+        self.excel_import_zone.setText(f"\u2705 {basename} ({num_v} variasi)")
 
         # Populate variation checkboxes
         self._populate_variation_checkboxes(result['variation_names'])

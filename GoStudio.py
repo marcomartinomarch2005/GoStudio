@@ -563,23 +563,23 @@ def upload_video_to_youtube(youtube, task, signals, task_index):
                 upload_thumb = thumbnail_path
                 file_size = os.path.getsize(thumbnail_path)
                 if file_size > 2 * 1024 * 1024:
-                    # Re-compress to fit within 2MB limit
-                    from PyQt6.QtGui import QPixmap
-                    from PyQt6.QtCore import Qt as QtCore_Qt
-                    pixmap = QPixmap(thumbnail_path)
-                    if not pixmap.isNull():
-                        resized = pixmap.scaled(1280, 720, QtCore_Qt.AspectRatioMode.IgnoreAspectRatio, QtCore_Qt.TransformationMode.SmoothTransformation)
-                        # Try decreasing quality until under 2MB
-                        import tempfile
-                        for quality in [85, 75, 65, 55, 45]:
-                            tmp_path = os.path.join(tempfile.gettempdir(), f"gostudio_thumb_{video_id}.jpg")
-                            resized.save(tmp_path, "JPG", quality)
-                            if os.path.getsize(tmp_path) <= 2 * 1024 * 1024:
-                                upload_thumb = tmp_path
-                                break
-                        else:
-                            upload_thumb = tmp_path  # use lowest quality anyway
-                        signals.log.emit(f"[Upload] Thumbnail dikompresi: {file_size//1024}KB → {os.path.getsize(upload_thumb)//1024}KB")
+                    # Re-compress to fit within 2MB limit using Pillow (thread-safe)
+                    from PIL import Image
+                    import tempfile
+                    img = Image.open(thumbnail_path)
+                    img = img.convert("RGB")
+                    img = img.resize((1280, 720), Image.LANCZOS)
+                    # Try decreasing quality until under 2MB
+                    for quality in [85, 75, 65, 55, 45]:
+                        tmp_path = os.path.join(tempfile.gettempdir(), f"gostudio_thumb_{video_id}.jpg")
+                        img.save(tmp_path, "JPEG", quality=quality)
+                        if os.path.getsize(tmp_path) <= 2 * 1024 * 1024:
+                            upload_thumb = tmp_path
+                            break
+                    else:
+                        upload_thumb = tmp_path  # use lowest quality anyway
+                    img.close()
+                    signals.log.emit(f"[Upload] Thumbnail dikompresi: {file_size//1024}KB → {os.path.getsize(upload_thumb)//1024}KB")
                 youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(upload_thumb)).execute()
                 signals.log.emit(f"[Upload] Thumbnail set: {os.path.basename(thumbnail_path)}")
             except Exception as e:
@@ -3193,6 +3193,28 @@ class GoStudioWindow(QMainWindow):
         jalur_simpan = tugas['output_path']
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+            # Validate video input file before starting
+            video_path = tugas['video']
+            if not os.path.exists(video_path):
+                self.signals.log.emit(f"[Encode] SKIP: Video tidak ditemukan: {video_path}")
+                return False
+            # Quick probe to check if video is readable
+            probe_cmd = [ffmpeg_exe, "-v", "error", "-i", video_path, "-f", "null", "-t", "0.1", "-"]
+            try:
+                probe_result = subprocess.run(
+                    probe_cmd, capture_output=True, text=True, timeout=15,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                if probe_result.returncode != 0:
+                    err_msg = probe_result.stderr.strip().split('\n')[-1] if probe_result.stderr else "unknown error"
+                    self.signals.log.emit(f"[Encode] SKIP: Video corrupt — {err_msg}")
+                    self.signals.log.emit(f"[Encode] File: {video_path}")
+                    return False
+            except subprocess.TimeoutExpired:
+                self.signals.log.emit(f"[Encode] SKIP: Video probe timeout — file mungkin corrupt")
+                return False
+
             mode_durasi = tugas.get('mode_durasi', 'audio')
             jumlah_loop = tugas.get('jumlah_loop', 1) if mode_durasi == "loop" else 1
             crossfade_enabled = tugas.get('crossfade', False)

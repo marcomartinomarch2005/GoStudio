@@ -3454,14 +3454,17 @@ class GoStudioWindow(QMainWindow):
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
             self._current_proc = proc
             pola = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})")
-            last_progress_time = time.time()
+            last_lines = []
             for line in proc.stdout:
                 if task_index in self._cancel_requested:
                     proc.kill()
                     return False
+                # Keep last 10 lines for error diagnosis
+                last_lines.append(line.rstrip())
+                if len(last_lines) > 10:
+                    last_lines.pop(0)
                 m = pola.search(line)
                 if m:
-                    last_progress_time = time.time()
                     h, mi, s = m.groups()
                     elapsed = int(h)*3600 + int(mi)*60 + float(s)
                     if total_durasi > 0:
@@ -3469,14 +3472,20 @@ class GoStudioWindow(QMainWindow):
                         self.signals.encode_progress.emit(task_index, pct)
             proc.wait(timeout=60)
             self._current_proc = None
+            if proc.returncode != 0:
+                # Log the last lines of FFmpeg output for debugging
+                for line in last_lines[-5:]:
+                    if line.strip():
+                        self.signals.log.emit(f"[FFmpeg] {line.strip()}")
             return proc.returncode == 0
         except subprocess.TimeoutExpired:
             proc.kill()
             self._current_proc = None
             self.signals.log.emit("[Encode] FFmpeg timeout saat wait.")
             return False
-        except Exception:
+        except Exception as e:
             self._current_proc = None
+            self.signals.log.emit(f"[Encode] Exception: {e}")
             return False
 
 

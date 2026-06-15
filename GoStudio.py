@@ -3065,6 +3065,14 @@ class GoStudioWindow(QMainWindow):
         self._log(f"[Encode] Mulai: {task['yt_title']}")
 
         def worker():
+            # Ensure any leftover FFmpeg process is killed before starting
+            if self._current_proc and self._current_proc.poll() is None:
+                try:
+                    self._current_proc.kill()
+                    self._current_proc.wait(timeout=5)
+                except Exception:
+                    pass
+                self._current_proc = None
             success = self._encode(task, task_index)
             self.signals.encode_done.emit(task_index, success)
 
@@ -3305,7 +3313,7 @@ class GoStudioWindow(QMainWindow):
         n = len(audio_list)
         if n < 2:
             return False
-        cmd = [ffmpeg_exe, "-y"]
+        cmd = [ffmpeg_exe, "-y", "-nostdin"]
         for path in audio_list:
             cmd += ["-i", path]
         filters = []
@@ -3320,7 +3328,7 @@ class GoStudioWindow(QMainWindow):
         filter_complex = ";".join(filters)
         cmd += ["-filter_complex", filter_complex, "-map", "[outa]", "-c:a", "aac", "-b:a", audio_bitrate, output_path]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
             pola_time = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})")
             total_cf_durasi = sum(durations) - crossfade_dur * (n - 1)
             for line in proc.stdout:
@@ -3333,8 +3341,11 @@ class GoStudioWindow(QMainWindow):
                     elapsed = int(h)*3600 + int(mi)*60 + float(s)
                     pct = min(100, int((elapsed / total_cf_durasi) * 50))  # crossfade = first 50%
                     self.signals.encode_progress.emit(task_index, pct)
-            proc.wait()
+            proc.wait(timeout=60)
             return proc.returncode == 0
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return False
         except Exception:
             return False
 
@@ -3473,39 +3484,71 @@ class GoStudioWindow(QMainWindow):
 
     def _run_ffmpeg(self, cmd, total_durasi, task_index):
         try:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore', creationflags=subprocess.CREATE_NO_WINDOW)
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
             self._current_proc = proc
-            pola = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})")
+            pola = re.compile(rb"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})")
             last_lines = []
-            for line in proc.stdout:
+            last_activity_time = time.time()
+            STALL_TIMEOUT = 300  # 5 minutes
+
+            # Read stdout in a separate thread to avoid blocking
+            import queue
+            line_queue = queue.Queue()
+            eof_flag = threading.Event()
+
+            def reader():
+                try:
+                    for raw_line in proc.stdout:
+                        line_queue.put(raw_line)
+                except Exception:
+                    pass
+                finally:
+                    eof_flag.set()
+
+            reader_thread = threading.Thread(target=reader, daemon=True)
+            reader_thread.start()
+
+            while not eof_flag.is_set() or not line_queue.empty():
                 if task_index in self._cancel_requested:
                     proc.kill()
                     return False
-                # Keep last 10 lines for error diagnosis
-                last_lines.append(line.rstrip())
+
+                # Check for stall
+                if time.time() - last_activity_time > STALL_TIMEOUT:
+                    self.signals.log.emit("[Encode] FFmpeg stall terdeteksi (5 menit tanpa output), killing...")
+                    proc.kill()
+                    return False
+
+                try:
+                    data = line_queue.get(timeout=2.0)
+                except queue.Empty:
+                    if proc.poll() is not None:
+                        break
+                    continue
+
+                last_activity_time = time.time()
+                line_str = data.decode('utf-8', errors='ignore').rstrip()
+                last_lines.append(line_str)
                 if len(last_lines) > 10:
                     last_lines.pop(0)
-                m = pola.search(line)
+                m = pola.search(data)
                 if m:
                     h, mi, s = m.groups()
-                    elapsed = int(h)*3600 + int(mi)*60 + float(s)
+                    elapsed = int(h)*3600 + int(mi)*60 + float(s.decode())
                     if total_durasi > 0:
                         pct = min(100.0, (elapsed / total_durasi) * 100)
                         self.signals.encode_progress.emit(task_index, pct)
-            proc.wait(timeout=60)
+
+            proc.wait(timeout=30)
             self._current_proc = None
             if proc.returncode != 0:
-                # Log the last lines of FFmpeg output for debugging
                 for line in last_lines[-5:]:
                     if line.strip():
                         self.signals.log.emit(f"[FFmpeg] {line.strip()}")
             return proc.returncode == 0
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            self._current_proc = None
-            self.signals.log.emit("[Encode] FFmpeg timeout saat wait.")
-            return False
         except Exception as e:
+            if proc and proc.poll() is None:
+                proc.kill()
             self._current_proc = None
             self.signals.log.emit(f"[Encode] Exception: {e}")
             return False

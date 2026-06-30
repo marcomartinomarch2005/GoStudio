@@ -1530,21 +1530,18 @@ class GoStudioWindow(QMainWindow):
         self.spin_video_audio_vol.setCurrentIndex(2)  # default 30%
         self.spin_video_audio_vol.setEnabled(False)
         self.spin_video_audio_vol.setToolTip("Volume audio bawaan video")
-        lbl_vid_audio = QLabel("Vol:")
-        lbl_vid_audio.setStyleSheet("font-size: 10px; color: #6B7280;")
-        vid_audio_row = QHBoxLayout()
-        vid_audio_row.setSpacing(4)
-        vid_audio_row.addWidget(lbl_vid_audio)
-        vid_audio_row.addWidget(self.spin_video_audio_vol)
+        lbl_vid_vol = QLabel("Vol:")
+        lbl_vid_vol.setStyleSheet("font-size: 10px; color: #6B7280;")
         grid.addWidget(self.chk_video_audio, 5, 0)
-        grid.addLayout(vid_audio_row, 5, 1, 1, 2)
+        grid.addWidget(lbl_vid_vol, 5, 1)
+        grid.addWidget(self.spin_video_audio_vol, 5, 2)
 
         l_render.addLayout(grid)
         scroll_layout.addWidget(c_render)
 
         # YouTube detail card
         c_yt, l_yt = make_card()
-        l_yt.setSpacing(6)
+        l_yt.setSpacing(5)
         l_yt.addWidget(make_card_title("\U0001F4FA Detail YouTube"))
 
         # Channel
@@ -1610,14 +1607,15 @@ class GoStudioWindow(QMainWindow):
         row_cpp = QHBoxLayout()
         row_cpp.setSpacing(8)
         cat_col = QVBoxLayout()
+        cat_col.setSpacing(2)
         cat_col.addWidget(QLabel("Kategori"))
         self.combo_category = ModernComboBox()
         self.combo_category.addItems(list(YOUTUBE_CATEGORIES.keys()))
         self.combo_category.setCurrentText("Music")
-        self.combo_category.setFixedHeight(36)
+        self.combo_category.setFixedHeight(30)
         self.combo_category.setStyleSheet(
             "QComboBox { background-color: #FAFBFC; border: 1px solid #E5E7EB; border-radius: 8px;"
-            "padding: 0px 10px; font-size: 13px; color: #1a1a2e; }"
+            "padding: 0px 10px; font-size: 12px; color: #1a1a2e; }"
             "QComboBox:hover { border-color: #0D9488; }"
             "QComboBox::drop-down { border: none; width: 20px; }"
             "QComboBox::down-arrow { image: none; }"
@@ -1626,13 +1624,14 @@ class GoStudioWindow(QMainWindow):
         row_cpp.addLayout(cat_col)
 
         pp_left = QVBoxLayout()
+        pp_left.setSpacing(2)
         pp_left.addWidget(QLabel("Playlist"))
         self.combo_playlist = ModernComboBox()
         self.combo_playlist.addItem("(Tidak ada)")
-        self.combo_playlist.setFixedHeight(36)
+        self.combo_playlist.setFixedHeight(30)
         self.combo_playlist.setStyleSheet(
             "QComboBox { background-color: #FAFBFC; border: 1px solid #E5E7EB; border-radius: 8px;"
-            "padding: 0px 10px; font-size: 13px; color: #1a1a2e; }"
+            "padding: 0px 10px; font-size: 12px; color: #1a1a2e; }"
             "QComboBox:hover { border-color: #0D9488; }"
             "QComboBox::drop-down { border: none; width: 20px; }"
             "QComboBox::down-arrow { image: none; }"
@@ -1641,14 +1640,15 @@ class GoStudioWindow(QMainWindow):
         row_cpp.addLayout(pp_left)
 
         pp_right = QVBoxLayout()
+        pp_right.setSpacing(2)
         pp_right.addWidget(QLabel("Privacy"))
         self.combo_privacy = ModernComboBox()
         self.combo_privacy.addItems(["Public", "Unlisted", "Private"])
         self.combo_privacy.setCurrentIndex(2)
-        self.combo_privacy.setFixedHeight(36)
+        self.combo_privacy.setFixedHeight(30)
         self.combo_privacy.setStyleSheet(
             "QComboBox { background-color: #FAFBFC; border: 1px solid #E5E7EB; border-radius: 8px;"
-            "padding: 0px 10px; font-size: 13px; color: #1a1a2e; }"
+            "padding: 0px 10px; font-size: 12px; color: #1a1a2e; }"
             "QComboBox:hover { border-color: #0D9488; }"
             "QComboBox::drop-down { border: none; width: 20px; }"
             "QComboBox::down-arrow { image: none; }"

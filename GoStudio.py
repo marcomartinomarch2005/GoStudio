@@ -110,7 +110,7 @@ def deteksi_gpu_encoder():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _COL_ALIASES = {
-    'variation': ['variation', 'variasi', 'version', 'group', 'variant', 'variation name'],
+    'variation': ['variation', 'variasi', 'version', 'group', 'variant', 'variation name', 'variations'],
     'track_order': ['track order', 'order', 'no', 'urutan', 'track', 'sequence', 'slot'],
     'title': ['title', 'judul', 'nama', 'working title', 'song', 'lagu',
               'track title', 'track name', 'new track name', 'primary title', 'primary song title'],
@@ -122,11 +122,12 @@ _COL_ALIASES = {
 }
 
 _SEO_COL_ALIASES = {
-    'variation': ['variation', 'variasi', 'version', 'variant', 'variation name'],
+    'variation': ['variation', 'variasi', 'version', 'variant', 'variation name', 'variations'],
     'seo_title': ['title', 'judul', 'youtube title', 'video title', 'seo title'],
     'seo_description': ['description', 'deskripsi', 'desc', 'youtube description', 'description + hashtags'],
     'seo_tags': ['tags', 'tag', 'keywords', 'keyword', 'youtube tags'],
     'seo_hashtags': ['hashtags', 'hashtag', '#'],
+    'seo_no': ['no', 'number', 'num', '#no'],
 }
 
 
@@ -134,11 +135,14 @@ def _detect_columns(header_row, aliases=None):
     if aliases is None:
         aliases = _COL_ALIASES
     mapping = {}
+    prefix_candidates = []  # (idx, key) - defer prefix matches
     for idx, cell in enumerate(header_row):
         if cell is None:
             continue
         val = str(cell).strip().lower()
+        exact_matched = False
         for key, alias_list in aliases.items():
+            # Exact match takes priority
             if val in alias_list:
                 if key in mapping:
                     existing_val = str(header_row[mapping[key]]).strip().lower() if header_row[mapping[key]] else ""
@@ -146,7 +150,22 @@ def _detect_columns(header_row, aliases=None):
                         mapping[key] = idx
                 else:
                     mapping[key] = idx
+                exact_matched = True
                 break
+        if not exact_matched:
+            # Collect prefix matches as candidates (applied after all exact matches)
+            for key, alias_list in aliases.items():
+                for alias in alias_list:
+                    if val.startswith(alias + ' ') or val.startswith(alias + '('):
+                        prefix_candidates.append((idx, key))
+                        break
+                else:
+                    continue
+                break
+    # Apply prefix matches only if key not already mapped by exact match
+    for idx, key in prefix_candidates:
+        if key not in mapping:
+            mapping[key] = idx
     return mapping
 
 
@@ -338,6 +357,7 @@ def _parse_visual_seo(filepath):
 
         # Found a valid SEO sheet — determine variation name column
         var_col = col_map.get('variation')
+        no_col = col_map.get('seo_no')  # Fallback: use 'No' column as variation key
 
         for row in rows[header_idx + 1:]:
             if row is None or all(c is None for c in row):
@@ -347,6 +367,9 @@ def _parse_visual_seo(filepath):
             var_name = None
             if var_col is not None and var_col < len(row) and row[var_col]:
                 var_name = str(row[var_col]).strip()
+            # Fallback: use 'No' column as variation key (matches numeric variation names like "1", "2")
+            if not var_name and no_col is not None and no_col < len(row) and row[no_col]:
+                var_name = str(int(row[no_col]) if isinstance(row[no_col], (int, float)) else row[no_col]).strip()
             if not var_name:
                 continue
 
@@ -523,7 +546,8 @@ class YouTubeAuth:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def upload_video_to_youtube(youtube, task, signals, task_index):
-    """Upload a single video to YouTube with resumable upload. Returns video_id or None."""
+    """Upload a single video to YouTube with resumable upload and retry logic. Returns video_id or None."""
+    MAX_RETRIES = 5
     try:
         video_path = task["video_path"]
         title = task["yt_title"]
@@ -548,11 +572,27 @@ def upload_video_to_youtube(youtube, task, signals, task_index):
         request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
 
         response = None
+        retry_count = 0
         while response is None:
-            status, response = request.next_chunk()
-            if status:
-                pct = status.progress() * 100
-                signals.upload_progress.emit(task_index, pct)
+            try:
+                status, response = request.next_chunk()
+                if status:
+                    pct = status.progress() * 100
+                    signals.upload_progress.emit(task_index, pct)
+                retry_count = 0  # reset on successful chunk
+            except (ConnectionResetError, ConnectionAbortedError, OSError, Exception) as chunk_err:
+                err_str = str(chunk_err)
+                # Retry on transient network errors
+                if any(keyword in err_str for keyword in ["10054", "10053", "ConnectionReset", "BrokenPipe", "RemoteDisconnected", "IncompleteRead"]):
+                    retry_count += 1
+                    if retry_count > MAX_RETRIES:
+                        signals.log.emit(f"[Upload] Gagal setelah {MAX_RETRIES} retry: {chunk_err}")
+                        return None
+                    wait_time = min(2 ** retry_count, 60)
+                    signals.log.emit(f"[Upload] Koneksi terputus, retry {retry_count}/{MAX_RETRIES} dalam {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    raise  # non-transient error, propagate
 
         video_id = response.get("id", "")
         signals.log.emit(f"[Upload] Selesai! ID: {video_id} | https://youtu.be/{video_id}")
@@ -1482,6 +1522,23 @@ class GoStudioWindow(QMainWindow):
         grid.addWidget(self.chk_overlay, 4, 0)
         grid.addWidget(self.combo_overlay_pos, 4, 1, 1, 2)
 
+        self.chk_video_audio = QCheckBox("Audio Bawaan Video")
+        self.chk_video_audio.setToolTip("Ikutkan audio asli dari video (mix dengan musik)")
+        self.chk_video_audio.toggled.connect(lambda c: self.spin_video_audio_vol.setEnabled(c))
+        self.spin_video_audio_vol = ModernComboBox()
+        self.spin_video_audio_vol.addItems(["10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"])
+        self.spin_video_audio_vol.setCurrentIndex(2)  # default 30%
+        self.spin_video_audio_vol.setEnabled(False)
+        self.spin_video_audio_vol.setToolTip("Volume audio bawaan video")
+        lbl_vid_audio = QLabel("Vol:")
+        lbl_vid_audio.setStyleSheet("font-size: 10px; color: #6B7280;")
+        vid_audio_row = QHBoxLayout()
+        vid_audio_row.setSpacing(4)
+        vid_audio_row.addWidget(lbl_vid_audio)
+        vid_audio_row.addWidget(self.spin_video_audio_vol)
+        grid.addWidget(self.chk_video_audio, 5, 0)
+        grid.addLayout(vid_audio_row, 5, 1, 1, 2)
+
         l_render.addLayout(grid)
         scroll_layout.addWidget(c_render)
 
@@ -1834,6 +1891,17 @@ class GoStudioWindow(QMainWindow):
         )
         self.btn_start_pipeline.clicked.connect(self._start_pipeline)
         l_queue.addWidget(self.btn_start_pipeline)
+
+        self.btn_retry_failed = QPushButton("\u21BB Retry Upload Gagal")
+        self.btn_retry_failed.setCursor(Qt.PointingHandCursor)
+        self.btn_retry_failed.setStyleSheet(
+            "QPushButton { background-color: #FEF3C7; color: #92400E; border: 1px solid #FDE68A;"
+            "border-radius: 10px; padding: 10px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #FDE68A; }"
+        )
+        self.btn_retry_failed.clicked.connect(self._retry_all_failed)
+        self.btn_retry_failed.setVisible(False)
+        l_queue.addWidget(self.btn_retry_failed)
 
         c_queue.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         col.addWidget(c_queue, 1)
@@ -2390,6 +2458,8 @@ class GoStudioWindow(QMainWindow):
                 'audio_bitrate': audio_bitrate,
                 'crossfade': crossfade_enabled,
                 'crossfade_dur': crossfade_dur,
+                'video_audio': self.chk_video_audio.isChecked(),
+                'video_audio_vol': int(self.spin_video_audio_vol.currentText().replace('%', '')) / 100.0 if self.chk_video_audio.isChecked() else 0,
                 'channel': channel_name,
                 'yt_title': yt_title[:100],
                 'yt_description': yt_description,
@@ -2907,6 +2977,8 @@ class GoStudioWindow(QMainWindow):
             'audio_bitrate': audio_bitrate,
             'crossfade': crossfade_enabled,
             'crossfade_dur': crossfade_dur,
+            'video_audio': self.chk_video_audio.isChecked(),
+            'video_audio_vol': int(self.spin_video_audio_vol.currentText().replace('%', '')) / 100.0 if self.chk_video_audio.isChecked() else 0,
             # Upload params
             'channel': channel_name,
             'yt_title': yt_title,
@@ -2977,6 +3049,19 @@ class GoStudioWindow(QMainWindow):
             "QPushButton:hover { background: #FEE2E2; }"
         )
         btn_delete.clicked.connect(lambda checked, idx=task_index: self._delete_pipeline_task(idx))
+
+        # Retry upload button (hidden by default, shown on upload failure)
+        btn_retry = QPushButton("\u21BB")
+        btn_retry.setFixedSize(22, 22)
+        btn_retry.setToolTip("Retry Upload")
+        btn_retry.setStyleSheet(
+            "QPushButton { background: none; border: none; color: #0D9488; font-size: 14px; border-radius: 4px; }"
+            "QPushButton:hover { background: #D1FAE5; }"
+        )
+        btn_retry.clicked.connect(lambda checked, idx=task_index: self._retry_upload(idx))
+        btn_retry.setVisible(False)
+
+        row.addWidget(btn_retry)
         row.addWidget(btn_delete)
 
         frame = QFrame()
@@ -2991,6 +3076,7 @@ class GoStudioWindow(QMainWindow):
             'lbl_encode_status': lbl_encode_status,
             'lbl_upload_status': lbl_upload_status,
             'btn_delete': btn_delete,
+            'btn_retry': btn_retry,
         })
 
     def _delete_pipeline_task(self, task_index):
@@ -3041,13 +3127,16 @@ class GoStudioWindow(QMainWindow):
                 self._start_upload(next_upload)
 
         # Check if all done
-        all_done = all(t['status'] in ('done', 'failed', 'cancelled') for t in self.pipeline_queue)
+        all_done = all(t['status'] in ('done', 'failed', 'upload_failed', 'cancelled') for t in self.pipeline_queue)
         if all_done and self._encode_slot is None and self._upload_slot is None:
             self.btn_start_pipeline.setEnabled(True)
             self.btn_start_pipeline.setText("\u25b6 Mulai Pipeline")
             self._log("=" * 30)
             self._log("PIPELINE SELESAI!")
             self._log("=" * 30)
+            # Show retry button if there are upload failures
+            has_upload_failed = any(t['status'] == 'upload_failed' for t in self.pipeline_queue)
+            self.btn_retry_failed.setVisible(has_upload_failed)
             self._update_slot_indicators()
 
     def _find_next(self, status):
@@ -3125,6 +3214,9 @@ class GoStudioWindow(QMainWindow):
         task = self.pipeline_queue[task_index]
         status = task['status']
 
+        # Hide retry button by default
+        w['btn_retry'].setVisible(False)
+
         if status == 'encoding':
             w['lbl_encode_status'].setText("\U0001F504 Encoding")
             w['lbl_encode_status'].setStyleSheet("font-size: 9px; padding: 2px 5px; border-radius: 8px; background: #DBEAFE; color: #1D4ED8; font-weight: 600;")
@@ -3144,6 +3236,14 @@ class GoStudioWindow(QMainWindow):
             w['lbl_upload_status'].setStyleSheet("font-size: 9px; padding: 2px 5px; border-radius: 8px; background: #D1FAE5; color: #059669; font-weight: 600;")
             w['frame'].setStyleSheet("QFrame { background-color: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 8px; }")
             w['lbl_num'].setStyleSheet("background-color: #D1FAE5; color: #059669; border-radius: 11px; font-size: 10px; font-weight: bold;")
+        elif status == 'upload_failed':
+            w['lbl_encode_status'].setText("\u2714 Encoded")
+            w['lbl_encode_status'].setStyleSheet("font-size: 9px; padding: 2px 5px; border-radius: 8px; background: #D1FAE5; color: #059669; font-weight: 600;")
+            w['lbl_upload_status'].setText("\u2716 Upload Gagal")
+            w['lbl_upload_status'].setStyleSheet("font-size: 9px; padding: 2px 5px; border-radius: 8px; background: #FEE2E2; color: #DC2626; font-weight: 600;")
+            w['frame'].setStyleSheet("QFrame { background-color: #FEF2F2; border: 1px solid #FECACA; border-radius: 8px; }")
+            w['lbl_num'].setStyleSheet("background-color: #FEE2E2; color: #DC2626; border-radius: 11px; font-size: 10px; font-weight: bold;")
+            w['btn_retry'].setVisible(True)
         elif status == 'failed':
             w['lbl_encode_status'].setText("\u2716 Gagal")
             w['lbl_encode_status'].setStyleSheet("font-size: 9px; padding: 2px 5px; border-radius: 8px; background: #FEE2E2; color: #DC2626; font-weight: 600;")
@@ -3178,7 +3278,7 @@ class GoStudioWindow(QMainWindow):
             task['status'] = 'done'
             self._log(f"[Upload] Selesai: {task['yt_title']}")
         else:
-            task['status'] = 'failed'
+            task['status'] = 'upload_failed'
             self._log(f"[Upload] GAGAL: {task['yt_title']}")
         self._update_task_ui(task_index)
         self._update_slot_indicators()
@@ -3188,6 +3288,50 @@ class GoStudioWindow(QMainWindow):
         if task_index < len(self.pipeline_queue):
             self.pipeline_queue[task_index]['status'] = new_status
             self._update_task_ui(task_index)
+
+    def _retry_upload(self, task_index):
+        """Retry upload for a task that failed during upload (video already encoded)."""
+        if task_index >= len(self.pipeline_queue):
+            return
+        task = self.pipeline_queue[task_index]
+        if task['status'] != 'upload_failed':
+            return
+        # Check video file still exists
+        video_path = task.get('video_path', '')
+        if not video_path or not os.path.exists(video_path):
+            self._log(f"[Retry] File video tidak ditemukan: {video_path}")
+            QMessageBox.warning(self, "Retry Gagal", "File video hasil encode tidak ditemukan. Perlu encode ulang.")
+            return
+        self._log(f"[Retry] Retry upload: {task['yt_title']}")
+        # Re-authenticate channel to get fresh credentials
+        channel_name = task['channel']
+        youtube, err = YouTubeAuth.get_service(channel_name)
+        if youtube:
+            self.channels[channel_name] = youtube
+        self._start_upload(task_index)
+
+    def _retry_all_failed(self):
+        """Retry all tasks that failed during upload."""
+        failed_indices = [i for i, t in enumerate(self.pipeline_queue) if t['status'] == 'upload_failed']
+        if not failed_indices:
+            QMessageBox.information(self, "Info", "Tidak ada upload yang gagal.")
+            return
+        self._log(f"[Retry] Retry {len(failed_indices)} upload gagal...")
+        self.btn_retry_failed.setVisible(False)
+        # Re-authenticate channels
+        channels_refreshed = set()
+        for i in failed_indices:
+            ch = self.pipeline_queue[i]['channel']
+            if ch not in channels_refreshed:
+                youtube, err = YouTubeAuth.get_service(ch)
+                if youtube:
+                    self.channels[ch] = youtube
+                channels_refreshed.add(ch)
+        # Set all to 'encoded' so pipeline picks them up
+        for i in failed_indices:
+            self.pipeline_queue[i]['status'] = 'encoded'
+            self._update_task_ui(i)
+        self._advance_pipeline()
 
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -3351,21 +3495,48 @@ class GoStudioWindow(QMainWindow):
 
     def _build_cmd_with_audio_file(self, tugas, ffmpeg_exe, audio_file_path, total_durasi, jalur_simpan):
         fps = tugas['fps']
-        cmd = [ffmpeg_exe, "-y", "-nostdin", "-stream_loop", "-1", "-i", tugas['video'], "-i", audio_file_path, "-map", "0:v", "-map", "1:a"]
+        video_audio = tugas.get('video_audio', False)
+        video_audio_vol = tugas.get('video_audio_vol', 0.3)
+
+        cmd = [ffmpeg_exe, "-y", "-nostdin", "-stream_loop", "-1", "-i", tugas['video'], "-i", audio_file_path]
+
+        if video_audio:
+            # Mix video's original audio with music audio
+            cmd += ["-filter_complex", f"[0:a]volume={video_audio_vol}[va];[1:a]volume=1.0[ma];[va][ma]amix=inputs=2:duration=shortest[aout]"]
+            cmd += ["-map", "0:v", "-map", "[aout]"]
+        else:
+            cmd += ["-map", "0:v", "-map", "1:a"]
+
         vf_filter = self._build_overlay_filter(tugas) if tugas.get('overlay') else None
         if vf_filter:
             cmd += ["-vf", vf_filter]
         self._append_video_encoder_options(cmd, tugas)
-        cmd += ["-r", fps, "-c:a", "copy", "-t", str(total_durasi), jalur_simpan]
+
+        if video_audio:
+            audio_bitrate = tugas.get('audio_bitrate', '256k')
+            cmd += ["-r", fps, "-c:a", "aac", "-b:a", audio_bitrate, "-t", str(total_durasi), jalur_simpan]
+        else:
+            cmd += ["-r", fps, "-c:a", "copy", "-t", str(total_durasi), jalur_simpan]
         return cmd
 
     def _build_cmd(self, tugas, ffmpeg_exe, file_list_path, total_durasi, jalur_simpan):
         fps = tugas['fps']
         mode_durasi = tugas.get('mode_durasi', 'audio')
+        video_audio = tugas.get('video_audio', False)
+        video_audio_vol = tugas.get('video_audio_vol', 0.3)
+
         cmd = [ffmpeg_exe, "-y", "-nostdin", "-stream_loop", "-1", "-i", tugas['video']]
         if mode_durasi == "manual":
             cmd += ["-stream_loop", "-1"]
-        cmd += ["-f", "concat", "-safe", "0", "-i", file_list_path, "-map", "0:v", "-map", "1:a"]
+        cmd += ["-f", "concat", "-safe", "0", "-i", file_list_path]
+
+        if video_audio:
+            # Mix video's original audio with concat music audio
+            cmd += ["-filter_complex", f"[0:a]volume={video_audio_vol}[va];[1:a]volume=1.0[ma];[va][ma]amix=inputs=2:duration=shortest[aout]"]
+            cmd += ["-map", "0:v", "-map", "[aout]"]
+        else:
+            cmd += ["-map", "0:v", "-map", "1:a"]
+
         vf_filter = self._build_overlay_filter(tugas) if tugas.get('overlay') else None
         if vf_filter:
             cmd += ["-vf", vf_filter]
